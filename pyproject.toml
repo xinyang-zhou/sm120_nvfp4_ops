@@ -1,0 +1,22 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "torch"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "sm120-nvfp4-ops"
+version = "0.1.0"
+description = "Native SM120 NVFP4 GEMM, grouped GEMM, and fused MoE kernels"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.7"]
+license = {file = "LICENSE"}
+authors = [{name = "Xinyang"}]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C++",
+  "Operating System :: POSIX :: Linux",
+]
+
+[tool.scikit-build]
+cmake.args = ["-DSM120_NVFP4_BUILD_TORCH=ON"]
+wheel.packages = ["python/sm120_nvfp4"]

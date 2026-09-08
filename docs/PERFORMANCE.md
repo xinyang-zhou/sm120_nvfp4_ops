@@ -1,0 +1,123 @@
+# Performance
+
+## Methodology
+
+Unless noted otherwise, results were measured on an idle NVIDIA GeForce RTX 5090 with CUDA 13.2, driver 595.84, cuBLASLt 13.4 and CUTLASS 4.2.1.
+
+The current GEMM benchmark compares three independent paths:
+
+1. repository-owned Custom CuTe kernel;
+2. CUTLASS `GemmUniversalAdapter` reference;
+3. cuBLASLt with the fastest successfully timed heuristic candidate.
+
+All paths:
+
+- consume identical packed E2M1 inputs and UE4M3 physical scale buffers;
+- accumulate in FP32 and output FP16;
+- run on one CUDA stream and are measured with CUDA Events after warmup;
+- validate every output element;
+- report dense-equivalent `2*M*N*K` FLOP/s.
+
+The CUTLASS and Custom CuTe outputs are row-major. cuBLASLt returns the equivalent column-major view; the benchmark accounts for this during validation.
+
+## Custom CuTe single GEMM
+
+Current measurements for `N=4096, K=8192`:
+
+| M | Implementation | Latency | TFLOP/s | vs cuBLASLt | Validation |
+|---:|---|---:|---:|---:|---:|
+| 16 | Custom CuTe | 25.2 us | 42.5665 | 104.3358% | 0 mismatches |
+| 16 | CUTLASS reference | 26.2 us | 41.0031 | 100.5037% | 0 mismatches |
+| 16 | cuBLASLt id 70 | 26.3 us | 40.7976 | 100% | reference |
+| 128 | Custom CuTe | 30.0 us | 286.7144 | 61.2723% | 0 mismatches |
+| 128 | CUTLASS reference | 26.4 us | 325.4973 | 69.5604% | 0 mismatches |
+| 128 | cuBLASLt id 70 | 18.4 us | 467.9348 | 100% | reference |
+| 512 | Custom CuTe | 34.8 us | 987.0538 | 85.5611% | 0 mismatches |
+| 512 | CUTLASS reference | 28.3 us | 1215.4651 | 105.3605% | 0 mismatches |
+| 512 | cuBLASLt id 70 | 29.8 us | 1153.6246 | 100% | reference |
+
+Measurement counts:
+
+- M=16: 50 warmups, 500 iterations;
+- M=128: 30 warmups, 300 iterations;
+- M=512: 30 warmups, 200 iterations.
+
+Interpretation:
+
+- At M=16, the Custom CuTe path removes part of the generic adapter/scheduler overhead and reaches 104.34% of the selected cuBLASLt algorithm.
+- At M=128, cuBLASLt selects a 12 MiB-workspace candidate and is substantially faster than both repository paths.
+- At M=512, the CUTLASS reference remains strong while Custom CuTe reaches 85.56%; the current scalar/predicated epilogue and fixed one-CTA-per-output-tile scheduling are the primary optimization targets.
+- Correctness is not inferred from matching aggregate statistics: every result element is compared, and Custom CuTe also matches the row-major CUTLASS reference exactly in these runs.
+
+## Historical CUTLASS-only sweep
+
+Before Custom CuTe was added, `nvfp4_gemm_sm120` referred to the CUTLASS Collective implementation. The earlier sweep below is retained for experiment history, but it must not be presented as Custom CuTe performance.
+
+| M | CUTLASS Collective TFLOP/s | cuBLASLt TFLOP/s | Relative |
+|---:|---:|---:|---:|
+| 16 | 39.50 | 40.78 | 96.86% |
+| 32 | 78.73 | 116.20 | 67.75% |
+| 64 | 157.94 | 232.78 | 67.85% |
+| 128 | 316.03 | 465.36 | 67.91% |
+| 256 | 629.36 | 697.95 | 90.17% |
+| 512 | 1196.34 | 1157.07 | 103.39% |
+| 1024 | 1081.22 | 1195.05 | 90.48% |
+| 2048 | 1081.96 | 1243.43 | 87.01% |
+| 4096 | 1257.44 | 1294.77 | 97.12% |
+
+Consequently, the historical M=512 result means “configured CUTLASS Collective exceeded the selected cuBLASLt heuristic on this shape,” not “the repository-owned Custom CuTe kernel exceeded cuBLASLt.”
+
+## Generated instruction verification
+
+The repository-owned kernel symbol appears as `sm120_nvfp4::cute_gemm_detail::nvfp4_gemm_kernel<...>`. Disassembly of the linked test binary shows `OMMA.SF` inside that function:
+
+```text
+Function : ...cute_gemm_detail...nvfp4_gemm_kernel...
+OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X
+```
+
+This verifies that the custom path executes native SM120 block-scaled Tensor Core instructions rather than dequantizing to a wider type.
+
+## Grouped GEMM
+
+The native cuBLASLt pointer-array grouped layout probe returns:
+
+```text
+heuristic status=7 count=0
+```
+
+For this CUDA/cuBLASLt release, the tested NVFP4 grouped configuration has no usable native heuristic. The available baseline is therefore explicitly a loop baseline: one native GEMM launch per expert.
+
+For equal per-expert `M=16`, `N=4096`, `K=8192`:
+
+| Groups | Total M | Persistent grouped ms | cuBLASLt loop ms | Relative throughput |
+|---:|---:|---:|---:|---:|
+| 1 | 16 | 0.0742 | 0.0380 | 51.22% |
+| 2 | 32 | 0.0891 | 0.0747 | 83.84% |
+| 4 | 64 | 0.0770 | 0.1442 | 187.23% |
+| 8 | 128 | 0.1516 | 0.2867 | 189.08% |
+| 16 | 256 | 0.2524 | 0.5746 | 227.64% |
+| 32 | 512 | 0.4322 | 1.1460 | 265.16% |
+
+These numbers include the custom grouped operator's per-call metadata/TensorMap setup. The loop excludes output concatenation but necessarily contains G GEMM launches. This answers “persistent grouped launch versus a loop of native GEMMs”; it is not a comparison with a native cuBLASLt grouped NVFP4 kernel.
+
+## Fused MoE
+
+The fused operator has correctness coverage but does not yet have a checked-in standalone end-to-end benchmark. A publishable number must specify model dimensions, token distribution, top-k, allocation policy, warmup, iteration count and a decomposed baseline.
+
+## Reproduction
+
+```bash
+./scripts/build.sh
+CUDA_VISIBLE_DEVICES=0 ./scripts/benchmark.sh \
+  16 4096 8192 --warmup 50 --iterations 500 --heuristics 16
+```
+
+Representative M=512 command:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./scripts/benchmark.sh \
+  512 4096 8192 --warmup 30 --iterations 200 --heuristics 16
+```
+
+Always record clocks/power mode, driver, CUDA, cuBLASLt, CUTLASS commit and GPU occupancy conditions when publishing results.
