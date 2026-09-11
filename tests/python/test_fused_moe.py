@@ -195,5 +195,110 @@ class FusedMoeTest(unittest.TestCase):
         )
 
 
+    def test_expert_major_handoff_matches_reroute(self) -> None:
+        require_sm120()
+        device = "cuda"
+        rows, experts, hidden, intermediate = 5, 2, 128, 64
+        torch.manual_seed(7)
+        x = (
+            torch.randn(rows, hidden, dtype=torch.bfloat16, device=device)
+            * 0.25
+        ).contiguous()
+        seqlens = torch.tensor(
+            [2, 3], dtype=torch.int32, device=device
+        )
+        cu_seqlens = torch.tensor(
+            [0, 2, 5], dtype=torch.int32, device=device
+        )
+        packed, scales = sm120_nvfp4.quantize_expert(
+            x, seqlens, cu_seqlens, scale_m_pad=128
+        )
+
+        gate_up_weight = torch.full(
+            (experts, 2 * intermediate, hidden // 2),
+            0x11,
+            dtype=torch.uint8,
+            device=device,
+        )
+        down_weight = torch.full(
+            (experts, hidden, intermediate // 2),
+            0x11,
+            dtype=torch.uint8,
+            device=device,
+        )
+        gate_up_scale = torch.full(
+            (
+                experts,
+                128 * sm120_nvfp4.scale_k_padded(hidden),
+            ),
+            0x38,
+            dtype=torch.uint8,
+            device=device,
+        )
+        down_scale = torch.full(
+            (
+                experts,
+                128 * sm120_nvfp4.scale_k_padded(intermediate),
+            ),
+            0x38,
+            dtype=torch.uint8,
+            device=device,
+        )
+
+        workspace_bytes = sm120_nvfp4.expert_moe_workspace_bytes(
+            rows, hidden, intermediate, experts, 128
+        )
+        workspace = torch.empty(
+            workspace_bytes, dtype=torch.uint8, device=device
+        )
+        direct_output = torch.empty(
+            rows, hidden, dtype=torch.float16, device=device
+        )
+        direct = sm120_nvfp4.expert_moe(
+            packed,
+            scales,
+            gate_up_weight,
+            gate_up_scale,
+            down_weight,
+            down_scale,
+            seqlens,
+            cu_seqlens,
+            output=direct_output,
+            workspace=workspace,
+        )
+
+        one_seqlen = torch.tensor(
+            [rows], dtype=torch.int32, device=device
+        )
+        one_cu_seqlen = torch.tensor(
+            [0, rows], dtype=torch.int32, device=device
+        )
+        baseline_input, baseline_scale = sm120_nvfp4.quantize_expert(
+            x, one_seqlen, one_cu_seqlen, scale_m_pad=128
+        )
+        topk_ids = torch.tensor(
+            [[0], [0], [1], [1], [1]],
+            dtype=torch.int32,
+            device=device,
+        )
+        topk_weights = torch.ones(
+            rows, 1, dtype=torch.float32, device=device
+        )
+        baseline = sm120_nvfp4.fused_moe(
+            baseline_input,
+            baseline_scale.flatten(),
+            gate_up_weight,
+            gate_up_scale,
+            down_weight,
+            down_scale,
+            topk_ids,
+            topk_weights,
+        )
+        torch.cuda.synchronize()
+
+        self.assertEqual(direct.data_ptr(), direct_output.data_ptr())
+        torch.testing.assert_close(direct, baseline, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

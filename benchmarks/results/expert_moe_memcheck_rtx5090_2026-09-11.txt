@@ -1,0 +1,7 @@
+CUDA Compute Sanitizer
+Date: 2026-09-11
+GPU: physical GPU 1, NVIDIA GeForce RTX 5090
+Test: tests.python.test_fused_moe.FusedMoeTest.test_expert_major_handoff_matches_reroute
+Tool: memcheck
+Test result: OK
+Error summary: 0 errors

@@ -161,6 +161,55 @@ Constraints:
 - local experts occupy `[ep_rank*local_experts, (ep_rank+1)*local_experts)`;
 - routes outside the local interval do not contribute to the local result.
 
+## Dispatcher hand-off API
+
+A dispatcher that already produces expert-major expanded rows should avoid the
+routing work in `fused_moe`. First quantize its BF16/FP16 receive buffer:
+
+```python
+x_nvfp4, x_scale = sm120_nvfp4.quantize_expert(
+    recv_x,
+    seqlens,
+    cu_seqlens,
+    scale_m_pad=per_expert_scale_capacity,
+    output=optional_packed_buffer,
+    output_scale=optional_scale_buffer,
+)
+```
+
+Then run only the local Expert compute:
+
+```python
+workspace_bytes = sm120_nvfp4.expert_moe_workspace_bytes(
+    total_rows, hidden, intermediate, local_experts, scale_m_pad
+)
+workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
+
+expert_output = sm120_nvfp4.expert_moe(
+    x_nvfp4,
+    x_scale,
+    gate_up_weight,
+    gate_up_weight_scale,
+    down_weight,
+    down_weight_scale,
+    seqlens,
+    cu_seqlens,
+    output=optional_fp16_output,
+    workspace=workspace,
+)
+```
+
+`seqlens` and `cu_seqlens` describe the already grouped rows;
+`sum(seqlens) == recv_x.size(0)`. `scale_m_pad` is a multiple of 128 and
+must cover the largest Expert M. The output remains in expanded expert-major
+order, one row per route; top-k weighting and cross-rank reduction belong to
+the dispatcher's Combine step.
+
+The workspace stores gate/up output, dynamically quantized SwiGLU output and
+scales, both GEMMs' TensorMaps, and tile-prefix metadata. Reusing it avoids
+per-call temporary tensor allocation. It is stream-ordered and must stay alive
+until the current CUDA stream completes.
+
 ## Synchronization
 
 All entry points launch on the caller-provided/current CUDA stream and do not synchronize. Output and workspace tensors must remain alive until the stream completes.

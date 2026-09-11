@@ -23,6 +23,7 @@ Custom CuTe NVFP4 GEMM
 - 保留 CUTLASS Collective reference，并提供 Custom CuTe、CUTLASS、cuBLASLt 三方性能与正确性对照；
 - Grouped GEMM 在一次 persistent launch 中调度多个动态 M expert；
 - Fused MoE 包含路由重排、两次 Grouped GEMM、SiLU、动态 NVFP4 量化和 top-k reduce；
+- 提供 DeepEP-compatible Expert-major 接口，直接复用 Dispatch 分组布局与调用方 Workspace；
 - C++、PyTorch custom op 与 Python API 统一使用 `sm120_nvfp4` 命名空间；
 - 提供 cuBLASLt 原生 grouped API 能力探测，避免把 GEMM loop 误标为 grouped API；
 - 构建、测试、benchmark 和文档独立组织，便于后续接入 SGLang。
@@ -98,6 +99,7 @@ cmake -S . -B build \
 - Custom CuTe、默认 `gemm` 与 CUTLASS reference 一致性；
 - Grouped GEMM 不均匀 expert row count；
 - Fused MoE 本地/远端路由和非均匀 activation scale；
+- Expert-major 直连路径与完整路由路径的逐元素等价性；
 - 输出 buffer 复用以及 dtype/shape 约束。
 
 ## Python API
@@ -137,6 +139,26 @@ y_moe = sm120_nvfp4.fused_moe(
     topk_ids,
     topk_weights,
 )
+
+# DeepEP-style Expand Dispatch 已经按 Expert 排列 recv_x 时，
+# 直接量化并进入两次 Grouped GEMM，不重复本地路由。
+grouped_nvfp4, grouped_scale = sm120_nvfp4.quantize_expert(
+    recv_x,
+    seqlens,
+    cu_seqlens,
+    scale_m_pad=scale_m_pad,
+)
+expert_output = sm120_nvfp4.expert_moe(
+    grouped_nvfp4,
+    grouped_scale,
+    gate_up_weight,
+    gate_up_weight_scale,
+    down_weight,
+    down_weight_scale,
+    seqlens,
+    cu_seqlens,
+    workspace=reusable_workspace,
+)
 ```
 
 packed E2M1 tensor 可使用 `torch.uint8` 或 `torch.float4_e2m1fn_x2`。scale tensor 是包含 raw UE4M3 编码的 `torch.uint8`，使用 `Sm1xxBlockScaledConfig<16>` 物理布局。详细约束见 [API](docs/API.md)。
@@ -156,6 +178,19 @@ packed E2M1 tensor 可使用 `torch.uint8` 或 `torch.float4_e2m1fn_x2`。scale 
 
 `M=16` 说明手写 mainloop 能降低通用 adapter 的固定开销；`M=512` 暴露了当前 scalar/predicated epilogue 与单一 tile 配置的不足。完整测量方法和历史 CUTLASS sweep 见 [Performance](docs/PERFORMANCE.md)。
 
+双 GPU Expert-major 对接基准（GPU 1、2，`SYS` 跨 NUMA PCIe，
+256 tokens/rank，hidden 4096，intermediate 2048，top-k 2，32 Expert）：
+
+| 路由 | 直接交接计算 P50 | 重复路由计算 P50 | 计算段加速 | 端到端加速 |
+|---|---:|---:|---:|---:|
+| 均衡 | 0.2365 ms | 0.3002 ms | 1.27x | 1.04x |
+| 80% Rank 偏斜 | 0.1506 ms | 0.2049 ms | 1.36x | 1.03x |
+
+两条路径最大绝对误差均为 0。该结果使用
+`torch.distributed` 参考通信验证接口与控制路径，不代表 DeepEP 原生
+NVLink/RDMA Kernel 性能；详细定义和原始数据见
+[Performance](docs/PERFORMANCE.md)。
+
 ## Current limitations and roadmap
 
 - 仅支持 `compute_120a/sm_120a`；
@@ -163,8 +198,8 @@ packed E2M1 tensor 可使用 `torch.uint8` 或 `torch.float4_e2m1fn_x2`。scale 
 - Custom CuTe epilogue 仍由线程直接写 global memory，尚未使用向量化 copy/TMA store；
 - Grouped GEMM 要求所有 group 共享 N/K，M 由 `seqlens` 给出；
 - scale 必须预先转换为 SM1xx 物理布局；
-- Grouped GEMM/Fused MoE binding 仍会分配临时 tensor；
-- Fused MoE 聚焦单 EP rank 内计算，不包含 DeepEP/NCCL dispatch；
+- Grouped GEMM 与完整路由版 Fused MoE binding 仍会分配部分临时 tensor；Expert-major 路径支持调用方 Workspace 复用；
+- 当前双 GPU 基准使用参考通信验证接口，不包含 DeepEP 原生 NVLink/RDMA Kernel；
 - cuBLASLt 当前对测试的 NVFP4 pointer-array grouped 配置没有可用原生算法。
 
 下一步重点：
@@ -172,9 +207,9 @@ packed E2M1 tensor 可使用 `torch.uint8` 或 `torch.float4_e2m1fn_x2`。scale 
 - [ ] 为 `M=16/32/64` 与中大 M 分别增加 tile/stage specialization；
 - [ ] 用 vectorized shared-memory epilogue 或 TMA store 替换 scalar store；
 - [ ] 增加 host-side shape dispatch 与离线 autotuning；
-- [ ] 缓存 TMA descriptor 和 MoE 元数据 workspace；
-- [ ] 增加 Grouped GEMM/Fused MoE 的独立可复现 benchmark；
-- [ ] 接入 SGLang MoE runner 与 DeepEP-compatible dispatcher。
+- [x] 为 Expert-major 路径增加调用方 Workspace 和 MoE 元数据复用；
+- [x] 增加 Grouped GEMM 与双 GPU Fused MoE 对接的可复现 benchmark；
+- [ ] 接入 SGLang MoE runner 与 DeepEP 原生 dispatcher。
 
 ## Documentation
 

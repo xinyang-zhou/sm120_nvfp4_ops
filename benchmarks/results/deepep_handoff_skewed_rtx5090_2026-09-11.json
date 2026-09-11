@@ -1,0 +1,37 @@
+{
+  "date": "2026-09-11",
+  "hardware": "2 x NVIDIA GeForce RTX 5090",
+  "physical_gpus": [1, 2],
+  "gpu_topology": "SYS (cross-NUMA PCIe path, no NVLink)",
+  "driver": "595.84",
+  "cuda_toolkit": "13.2",
+  "transport": "torch.distributed NCCL reference transport",
+  "native_deepep_kernel": false,
+  "measurement": {
+    "warmup": 10,
+    "iterations": 100,
+    "pairing": "direct and reroute paths measured alternately; rank-max wall time"
+  },
+  "result": {
+    "status": "PASS",
+    "routing": "80% rank-skewed",
+    "tokens_per_rank": 256,
+    "hidden": 4096,
+    "intermediate": 2048,
+    "topk": 2,
+    "experts": 32,
+    "expert_tokens_global_min": 0,
+    "expert_tokens_global_max": 408,
+    "max_abs_diff_direct_vs_reroute": 0.0,
+    "direct_compute_p50_ms": 0.15060091391205788,
+    "direct_compute_p95_ms": 0.1579140080139041,
+    "reroute_compute_p50_ms": 0.20492100156843662,
+    "reroute_compute_p95_ms": 0.21307403221726418,
+    "compute_speedup": 1.3606889642655058,
+    "direct_e2e_p50_ms": 0.7905280217528343,
+    "direct_e2e_p95_ms": 0.8079620311036706,
+    "reroute_e2e_p50_ms": 0.8175279945135117,
+    "reroute_e2e_p95_ms": 0.8463680278509855,
+    "e2e_speedup": 1.0341543525564223
+  }
+}

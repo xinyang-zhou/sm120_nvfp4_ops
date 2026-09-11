@@ -104,6 +104,38 @@ Fused MoE reuses Grouped GEMM twice. It is not presented as one monolithic CUDA 
 5. down Grouped GEMM;
 6. scatter/reduce by top-k weights, optionally adding shared-expert output.
 
+## Dispatcher hand-off
+
+DeepEP-style expand dispatch already performs the first two local routing
+steps: it returns rows grouped by local Expert, per-Expert counts/prefix
+offsets, route weights and a handle for reverse Combine. Feeding that output
+back into the full `fused_moe` path would count and gather the same routes a
+second time.
+
+The `expert_moe` entry point therefore splits the ownership boundary at the
+dispatcher/computation interface:
+
+```text
+Expand Dispatch
+  -> expert-major BF16 rows + seqlens/cu_seqlens + route handle
+  -> per-Expert BF16-to-NVFP4 quantization
+  -> grouped gate/up GEMM
+  -> SiLU(gate) * up + dynamic NVFP4 quantization
+  -> grouped down GEMM
+  -> expanded FP16 rows
+  -> dispatcher Combine
+```
+
+This is a direct layout hand-off, not a literal zero-copy path: BF16/FP8
+communication output still needs conversion to the packed E2M1 payload and
+UE4M3 scale layout consumed by SM120 Tensor Cores. The persistent workspace
+keeps the conversion output, intermediate activations, TensorMaps and tile
+metadata at stable addresses across calls.
+
+The checked-in benchmark uses a readable `torch.distributed` reference
+transport to validate this contract on two GPUs. It deliberately does not
+claim to benchmark DeepEP's native NVLink/RDMA kernels.
+
 ## Scale layout
 
 Logical scales are not a flat `[M,K/16]` matrix. They use the physical layout produced by `cutlass::detail::Sm1xxBlockScaledConfig<16>`.

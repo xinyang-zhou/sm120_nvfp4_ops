@@ -102,6 +102,78 @@ def fused_moe(
     )
 
 
+def quantize_expert(
+    x: torch.Tensor,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    scale_m_pad: Optional[int] = None,
+    output: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an expert-major FP16/BF16 matrix to packed NVFP4."""
+    if scale_m_pad is None:
+        scale_m_pad = max(128, ((int(x.shape[0]) + 127) // 128) * 128)
+    return torch.ops.sm120_nvfp4.quantize_expert(
+        x, seqlens, cu_seqlens, scale_m_pad, output, output_scale
+    )
+
+
+def expert_moe_workspace_bytes(
+    total_rows: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    scale_m_pad: int,
+) -> int:
+    """Return bytes required by :func:`expert_moe` reusable scratch storage."""
+    del hidden_size
+    alignment = 256
+    total = 0
+
+    def reserve(size: int) -> None:
+        nonlocal total
+        total = ((total + alignment - 1) // alignment) * alignment
+        total += size
+
+    reserve(total_rows * intermediate_size * 4)
+    reserve(total_rows * intermediate_size // 2)
+    reserve(num_experts * scale_m_pad * scale_k_padded(intermediate_size))
+    reserve((num_experts * 3 + 2) * 128)
+    reserve((num_experts * 3 + 2) * 128)
+    reserve(num_experts * 4)
+    reserve((num_experts + 1) * 4)
+    return ((total + alignment - 1) // alignment) * alignment
+
+
+def expert_moe(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    seqlens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    output: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute already-routed expert-major activations without local re-routing."""
+    return torch.ops.sm120_nvfp4.expert_moe(
+        x,
+        x_scale,
+        gate_up_weight,
+        gate_up_weight_scale,
+        down_weight,
+        down_weight_scale,
+        seqlens,
+        cu_seqlens,
+        output,
+        workspace,
+    )
+
+
 def scale_k_padded(k: int) -> int:
     return ((k + 15) // 16 + 3) // 4 * 4
 
@@ -116,11 +188,14 @@ def scale_b_elements(m: int, n: int, k: int) -> int:
     return ((n + 127) // 128 * 128) * scale_k_padded(k)
 
 __all__ = [
+    "expert_moe",
+    "expert_moe_workspace_bytes",
     "fused_moe",
     "cute_gemm",
     "cutlass_gemm",
     "gemm",
     "grouped_gemm",
+    "quantize_expert",
     "scale_k_padded",
     "scale_a_elements",
     "scale_b_elements",

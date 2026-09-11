@@ -101,9 +101,55 @@ For equal per-expert `M=16`, `N=4096`, `K=8192`:
 
 These numbers include the custom grouped operator's per-call metadata/TensorMap setup. The loop excludes output concatenation but necessarily contains G GEMM launches. This answers “persistent grouped launch versus a loop of native GEMMs”; it is not a comparison with a native cuBLASLt grouped NVFP4 kernel.
 
-## Fused MoE
+## DeepEP-compatible Fused MoE hand-off
 
-The fused operator has correctness coverage but does not yet have a checked-in standalone end-to-end benchmark. A publishable number must specify model dimensions, token distribution, top-k, allocation policy, warmup, iteration count and a decomposed baseline.
+The repository now exposes an `expert_moe` path for activations that a
+dispatcher has already arranged in expert-major order. It consumes the
+dispatcher-provided `seqlens/cu_seqlens`, dynamically quantizes BF16
+activations to NVFP4, runs gate/up and down Persistent Grouped GEMMs, and
+returns one result per expanded route for the dispatcher to combine.
+
+The comparison uses the same reference Dispatch/Combine and the same expanded
+expert-major input for both paths:
+
+- **direct**: reuse expert layout and a caller-owned workspace, then call
+  `expert_moe`;
+- **reroute**: pass the already grouped input through the original
+  `fused_moe`, which repeats local count/gather/reduce and creates temporary
+  tensors.
+
+Configuration: 2 x RTX 5090 (physical GPU 1,2), cross-NUMA `SYS` PCIe path,
+256 tokens/rank, hidden 4096, intermediate 2048, top-k 2, 32 experts, 10
+warmups and 100 alternating paired measurements. Times are the slower rank's
+wall-clock P50.
+
+| Routing | Expert M range | Direct compute | Reroute compute | Compute speedup | Direct end-to-end | Reroute end-to-end | E2E speedup | Max diff |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Balanced | 32--32 | 0.2365 ms | 0.3002 ms | 1.27x | 0.8187 ms | 0.8496 ms | 1.04x | 0 |
+| 80% rank-skewed | 0--408 | 0.1506 ms | 0.2049 ms | 1.36x | 0.7905 ms | 0.8175 ms | 1.03x | 0 |
+
+This is an integration/control-path benchmark using a transparent
+`torch.distributed` NCCL reference transport. It is **not** a native DeepEP
+kernel or NVLink/RDMA bandwidth result. The useful result is that consuming
+the dispatcher layout directly reduces the local Expert compute path while
+keeping Dispatch/Combine semantics unchanged. Raw results:
+[balanced](../benchmarks/results/deepep_handoff_balanced_rtx5090_2026-09-11.json)
+and
+[skewed](../benchmarks/results/deepep_handoff_skewed_rtx5090_2026-09-11.json).
+The direct/reroute equivalence test also passes CUDA Compute Sanitizer memcheck
+with [0 errors](../benchmarks/results/expert_moe_memcheck_rtx5090_2026-09-11.txt).
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2 NCCL_IB_DISABLE=1 \
+PYTHONPATH="$PWD/build/python" \
+torchrun --standalone --nproc-per-node=2 \
+  benchmarks/benchmark_deepep_handoff.py \
+  --tokens 256 --hidden 4096 --intermediate 2048 \
+  --experts 32 --topk 2 --routing balanced \
+  --warmup 10 --iterations 100
+```
+
+Use `--routing skewed` for the second row.
 
 ## Reproduction
 
