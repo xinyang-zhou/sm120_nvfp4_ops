@@ -74,6 +74,29 @@ GemmStatus nvfp4_cute_gemm_sm120(
     const void* sfa, const void* sfb,
     half* c, cudaStream_t stream = nullptr);
 
+// FP32-output variant used by attention logits. The Tensor Core accumulation
+// is already FP32; this entry point preserves it instead of narrowing to FP16.
+GemmStatus nvfp4_cute_gemm_f32_sm120(
+    int m, int n, int k,
+    const void* a, const void* b,
+    const void* sfa, const void* sfb,
+    float* c, cudaStream_t stream = nullptr);
+
+// Strided-batched variants used by GQA decode. Operands are contiguous
+// [groups,M,K], [groups,N,K], and outputs are contiguous [groups,M,N]. Each
+// group owns one physical Sm1xxBlockScaledConfig<16> SFA/SFB region.
+GemmStatus nvfp4_cute_batched_gemm_sm120(
+    int groups, int m, int n, int k,
+    const void* a, const void* b,
+    const void* sfa, const void* sfb,
+    half* c, cudaStream_t stream = nullptr);
+
+GemmStatus nvfp4_cute_batched_gemm_f32_sm120(
+    int groups, int m, int n, int k,
+    const void* a, const void* b,
+    const void* sfa, const void* sfb,
+    float* c, cudaStream_t stream = nullptr);
+
 // CUTLASS Collective reference retained for correctness and performance
 // comparisons against both the custom CuTe kernel and cuBLASLt.
 std::size_t nvfp4_cutlass_gemm_workspace_size_sm120(int m, int n, int k);

@@ -57,6 +57,11 @@ sm120_nvfp4_configure_target(sm120_nvfp4_grouped_gemm)
 target_link_libraries(
   sm120_nvfp4_grouped_gemm PUBLIC sm120_nvfp4_common CUDA::cudart)
 
+add_library(sm120_nvfp4_attention STATIC src/attention/attention.cu)
+sm120_nvfp4_configure_target(sm120_nvfp4_attention)
+target_link_libraries(
+  sm120_nvfp4_attention PUBLIC sm120_nvfp4_gemm CUDA::cudart)
+
 add_library(sm120_nvfp4_fused_moe STATIC
   src/fused_moe/fused_moe.cu
   src/fused_moe/count_and_gather.cu
@@ -68,7 +73,8 @@ target_link_libraries(
 
 add_library(sm120_nvfp4 INTERFACE)
 target_link_libraries(sm120_nvfp4 INTERFACE
-  sm120_nvfp4_gemm sm120_nvfp4_grouped_gemm sm120_nvfp4_fused_moe)
+  sm120_nvfp4_gemm sm120_nvfp4_grouped_gemm sm120_nvfp4_attention
+  sm120_nvfp4_fused_moe)
 
 if(SM120_NVFP4_BUILD_TORCH)
   set(TORCH_ROOT "$ENV{TORCH_ROOT}" CACHE PATH "PyTorch package root")
@@ -80,6 +86,7 @@ if(SM120_NVFP4_BUILD_TORCH)
   endif()
   add_library(_C MODULE
     bindings/gemm_ops.cu
+    bindings/attention_ops.cpp
     bindings/grouped_gemm_ops.cpp
     bindings/fused_moe_ops.cpp)
   sm120_nvfp4_configure_target(_C)
@@ -133,6 +140,7 @@ install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(TARGETS
   sm120_nvfp4_common
   sm120_nvfp4_gemm
+  sm120_nvfp4_attention
   sm120_nvfp4_grouped_gemm
   sm120_nvfp4_fused_moe
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})

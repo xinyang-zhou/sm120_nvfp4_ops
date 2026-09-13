@@ -10,11 +10,12 @@ Layer 1: Single GEMM
   CUTLASS Collective reference ─────┼─ correctness/performance comparison
   cuBLASLt baseline ────────────────┘
                     |
-                    v
-Layer 2: Persistent Grouped GEMM
-  dynamic expert M + shared N/K + per-expert TensorMaps
-                    |
-                    v
+          ┌─────────┴──────────┐
+          v                    v
+Layer 2A: Dense Attention   Layer 2B: Persistent Grouped GEMM
+  QK^T -> softmax -> P@V      dynamic expert M + shared N/K
+                               |
+                               v
 Layer 3: Fused MoE
   route/count/gather
         -> grouped gate/up GEMM
@@ -79,6 +80,61 @@ Single and Grouped GEMM share [`Nvfp4GemmConfig`](../src/common/gemm_config.cuh)
 - TMA copy types and transaction byte count.
 
 The single kernel specializes scheduling for one matrix. Grouped GEMM adds runtime TensorMap patching and expert-aware tile traversal without changing the MMA contract.
+
+## Dense attention
+
+### Prefill
+
+The first SM120 attention path borrows the numerical decomposition used by
+high-performance prefill kernels while replacing SM90 WGMMA with this
+repository's SM120 block-scaled MMA:
+
+1. each `(batch, head)` computes packed NVFP4 `QK^T` with FP32 output;
+2. one CUDA block per query row applies suffix-aligned causal masking and a
+   stable FP32 max/sum softmax;
+3. each 16-element probability vector is dynamically quantized to E2M1 with
+   a UE4M3 scale in the CUTLASS SFA physical layout;
+4. each `(batch, head)` computes NVFP4 `P@V` into FP16;
+5. a final row correction divides by the reconstructed NVFP4 probability sum.
+
+This preserves the attention normalization invariant while letting both
+matrix products use `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`. The current path
+is a correctness-oriented first implementation: FP32 logits and packed
+probabilities live in caller-reusable workspace, and GEMMs are launched per
+head. A future fused schedule can tile QK, online softmax and PV without
+changing the public operand/scale contract.
+
+### Decode
+
+Single-token dense decode uses a fused 128-token streaming schedule. The
+`Hq/Hkv` query heads sharing one cache head become the MMA M dimension. Within
+each CTA, TMA feeds native SM120 NVFP4 QK, the resulting FP32 tile is consumed
+by online softmax, probabilities are quantized into shared-memory E2M1/UE4M3,
+and a second native NVFP4 MMA accumulates PV. The same 64 KiB shared-memory
+region is reused for Q/K storage and the temporary logits tile, so neither
+full logits nor full probabilities reach global memory.
+
+Low-occupancy requests split the KV sequence across CTAs, following Tencent's
+LSE-combine idea. Each split writes only an output-sized FP32 partial and one
+LSE per query head; a small combine kernel applies stable LSE weights. GQA/MQA
+reuses packed K/V without expansion. Per-head query scales are repacked into
+grouped tiles in reusable workspace. Device `kv_lengths[B]` supplies the last
+valid position without host synchronization.
+
+Tencent's SM90 WGMMA schedule is not directly portable, but its online
+softmax and split-K/LSE organization carries over. This SM120 implementation
+uses block-scaled `OMMA.SF` for both QK and PV.
+
+The paged entry point adds Tencent-style block-table indirection without
+materializing a dense cache. Physical caches are `[P,Hkv,S,D]` for K and
+`[P,Hkv,Dv,S]` for transposed V, with `S` equal to 32, 64, or 128. A CTA maps
+each logical 128-token tile to its physical pages, loads complete packed E2M1
+byte pairs into the same swizzled B-operand shared layout, and loads the
+corresponding per-page SFB metadata. Handling both nibbles in one thread is
+required: independent subbyte stores would race on a shared packed byte.
+After that load, paged and dense decode share the same native QK, online
+softmax, probability quantization, native PV, and LSE combine code. MTP and a
+dynamic device task map remain the next decode extensions.
 
 ## Grouped GEMM
 
@@ -154,6 +210,7 @@ Uniform tests can fill the physical allocation with one UE4M3 byte. Non-uniform 
 - `src/common/`: shared CuTe configuration and device helpers;
 - `src/gemm/`: Custom CuTe kernel and isolated CUTLASS reference;
 - `src/grouped_gemm/`: dynamic expert scheduling and compute kernel;
+- `src/attention/`: materialized prefill plus fused streaming/split-K decode;
 - `bindings/`: validation, allocation and PyTorch registration;
 - `tests/`: correctness and adversarial routing/layout cases;
 - `benchmarks/`: performance comparisons, never imported by the library.

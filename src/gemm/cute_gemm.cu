@@ -21,7 +21,7 @@ __global__ void __launch_bounds__(384, 1) nvfp4_gemm_kernel(
     CUTLASS_GRID_CONSTANT typename Config::TmaW const tma_w,
     CUTLASS_GRID_CONSTANT typename Config::TmaSFA const tma_sfa,
     CUTLASS_GRID_CONSTANT typename Config::TmaSFB const tma_sfb,
-    typename Config::Tout* output, int m, int n, int k) {
+    typename Config::Tout* output, int groups, int m, int n, int k) {
   using Tin = typename Config::Tin;
   using Tout = typename Config::Tout;
   using TS = typename Config::TS;
@@ -57,10 +57,10 @@ __global__ void __launch_bounds__(384, 1) nvfp4_gemm_kernel(
   auto sSFB =
       make_tensor(make_smem_ptr(storage.smem_SFB.begin()), SLayoutSFB{});
 
-  auto layout_sfa = Config::make_layout_sfa(m, n, k, 1);
-  auto layout_sfb = Config::make_layout_sfb(m, n, k, 1);
-  auto mX = tma_x.get_tma_tensor(make_shape(m, k, Int<1>{}));
-  auto mW = tma_w.get_tma_tensor(make_shape(n, k, Int<1>{}));
+  auto layout_sfa = Config::make_layout_sfa(m, n, k, groups);
+  auto layout_sfb = Config::make_layout_sfb(m, n, k, groups);
+  auto mX = tma_x.get_tma_tensor(make_shape(m, k, groups));
+  auto mW = tma_w.get_tma_tensor(make_shape(n, k, groups));
   auto mSFA = tma_sfa.get_tma_tensor(shape(layout_sfa));
   auto mSFB = tma_sfb.get_tma_tensor(shape(layout_sfb));
 
@@ -93,7 +93,8 @@ __global__ void __launch_bounds__(384, 1) nvfp4_gemm_kernel(
   int tile_count_m = (m + kTileM - 1) / kTileM;
   int tile_count_n = (n + kTileN - 1) / kTileN;
   int tile_count_k = (k + kTileK - 1) / kTileK;
-  int output_tile_count = tile_count_m * tile_count_n;
+  int tiles_per_group = tile_count_m * tile_count_n;
+  int output_tile_count = groups * tiles_per_group;
 
   if (thread_idx >= kMathThreads) {
     cutlass::arch::warpgroup_reg_dealloc<24>();
@@ -107,13 +108,15 @@ __global__ void __launch_bounds__(384, 1) nvfp4_gemm_kernel(
 
       for (int flat_tile = blockIdx.x; flat_tile < output_tile_count;
            flat_tile += gridDim.x) {
-        int tile_m = flat_tile / tile_count_n;
-        int tile_n = flat_tile % tile_count_n;
+        int group = flat_tile / tiles_per_group;
+        int local_tile = flat_tile % tiles_per_group;
+        int tile_m = local_tile / tile_count_n;
+        int tile_n = local_tile % tile_count_n;
 
-        auto gX = gX_mkl(_, _, tile_m, _, _0{});
-        auto gW = gW_nkl(_, _, tile_n, _, _0{});
-        auto gSFA = gSFA_mkl(_, _, tile_m, _, _0{});
-        auto gSFB = gSFB_nkl(_, _, tile_n, _, _0{});
+        auto gX = gX_mkl(_, _, tile_m, _, group);
+        auto gW = gW_nkl(_, _, tile_n, _, group);
+        auto gSFA = gSFA_mkl(_, _, tile_m, _, group);
+        auto gSFB = gSFB_nkl(_, _, tile_n, _, group);
         auto tXgX = tma_x_slice.partition_S(gX);
         auto tWgW = tma_w_slice.partition_S(gW);
         auto tSFAgSFA = tma_sfa_slice.partition_S(gSFA);
@@ -210,8 +213,10 @@ __global__ void __launch_bounds__(384, 1) nvfp4_gemm_kernel(
 
     for (int flat_tile = blockIdx.x; flat_tile < output_tile_count;
          flat_tile += gridDim.x) {
-      int tile_m = flat_tile / tile_count_n;
-      int tile_n = flat_tile % tile_count_n;
+      int group = flat_tile / tiles_per_group;
+      int local_tile = flat_tile % tiles_per_group;
+      int tile_m = local_tile / tile_count_n;
+      int tile_n = local_tile % tile_count_n;
       clear(accum);
 
 #pragma unroll 1
@@ -258,7 +263,7 @@ __global__ void __launch_bounds__(384, 1) nvfp4_gemm_kernel(
         int row = tile_m * kTileM + get<0>(coordinate);
         int column = tile_n * kTileN + get<1>(coordinate);
         if (row < m && column < n) {
-          output[static_cast<int64_t>(row) * n + column] =
+          output[(static_cast<int64_t>(group) * m + row) * n + column] =
               static_cast<Tout>(accum(i));
         }
       }
@@ -272,12 +277,11 @@ bool valid_shape(int m, int n, int k) {
          (n % kOutputAlignmentElements) == 0;
 }
 
-}  // namespace cute_gemm_detail
-
-GemmStatus nvfp4_cute_gemm_sm120(
-    int m, int n, int k, const void* a, const void* b,
-    const void* sfa, const void* sfb, half* c, cudaStream_t stream) {
-  if (!cute_gemm_detail::valid_shape(m, n, k) || a == nullptr ||
+template <typename Tout>
+GemmStatus launch_nvfp4_cute_gemm_sm120(
+    int groups, int m, int n, int k, const void* a, const void* b,
+    const void* sfa, const void* sfb, Tout* c, cudaStream_t stream) {
+  if (groups <= 0 || !cute_gemm_detail::valid_shape(m, n, k) || a == nullptr ||
       b == nullptr || sfa == nullptr || sfb == nullptr || c == nullptr) {
     return GemmStatus::kInvalidArgument;
   }
@@ -292,8 +296,7 @@ GemmStatus nvfp4_cute_gemm_sm120(
     return GemmStatus::kUnsupportedDevice;
   }
 
-  using Config = detail::Nvfp4GemmConfig<
-      cute::half_t, 128, 128, 128, 3>;
+  using Config = detail::Nvfp4GemmConfig<Tout, 128, 128, 128, 3>;
   using TmaInternalElementX = typename Config::TmaInternalElementX;
   using TmaInternalElementW = typename Config::TmaInternalElementW;
   using Scale = typename Config::TS;
@@ -301,23 +304,23 @@ GemmStatus nvfp4_cute_gemm_sm120(
   Config config;
   auto input = cute::make_tensor(
       cute::recast_ptr<TmaInternalElementX>(a),
-      cute::make_shape(int32_t(m), int32_t(k), int32_t(1)),
+      cute::make_shape(int32_t(m), int32_t(k), int32_t(groups)),
       typename Config::StrideX{int64_t(k), cute::Int<1>{},
                                int64_t(m) * k});
   auto weight = cute::make_tensor(
       cute::recast_ptr<TmaInternalElementW>(b),
-      cute::make_shape(int32_t(n), int32_t(k), int32_t(1)),
+      cute::make_shape(int32_t(n), int32_t(k), int32_t(groups)),
       typename Config::StrideW{int64_t(k), cute::Int<1>{},
                                int64_t(n) * k});
-  auto layout_sfa = Config::make_layout_sfa(m, n, k, 1);
-  auto layout_sfb = Config::make_layout_sfb(m, n, k, 1);
+  auto layout_sfa = Config::make_layout_sfa(m, n, k, groups);
+  auto layout_sfb = Config::make_layout_sfb(m, n, k, groups);
   auto input_scale = cute::make_tensor(
       reinterpret_cast<const Scale*>(sfa), layout_sfa);
   auto weight_scale = cute::make_tensor(
       reinterpret_cast<const Scale*>(sfb), layout_sfb);
   auto tma = config.get_tma(input, weight, input_scale, weight_scale);
 
-  int tile_count = cute::ceil_div(m, Config::kTileM) *
+  int tile_count = groups * cute::ceil_div(m, Config::kTileM) *
                    cute::ceil_div(n, Config::kTileN);
   int grid_size = std::min(properties.multiProcessorCount, tile_count);
   constexpr int kThreads = 384;
@@ -331,10 +334,42 @@ GemmStatus nvfp4_cute_gemm_sm120(
 
   kernel<<<grid_size, kThreads, kSharedMemoryBytes, stream>>>(
       tma.x, tma.w, tma.sfa, tma.sfb,
-      reinterpret_cast<typename Config::Tout*>(c), m, n, k);
+      reinterpret_cast<typename Config::Tout*>(c), groups, m, n, k);
   return cudaPeekAtLastError() == cudaSuccess
              ? GemmStatus::kSuccess
              : GemmStatus::kCudaError;
+}
+
+}  // namespace cute_gemm_detail
+
+GemmStatus nvfp4_cute_gemm_sm120(
+    int m, int n, int k, const void* a, const void* b,
+    const void* sfa, const void* sfb, half* c, cudaStream_t stream) {
+  return cute_gemm_detail::launch_nvfp4_cute_gemm_sm120(
+      1, m, n, k, a, b, sfa, sfb,
+      reinterpret_cast<cute::half_t*>(c), stream);
+}
+
+GemmStatus nvfp4_cute_gemm_f32_sm120(
+    int m, int n, int k, const void* a, const void* b,
+    const void* sfa, const void* sfb, float* c, cudaStream_t stream) {
+  return cute_gemm_detail::launch_nvfp4_cute_gemm_sm120(
+      1, m, n, k, a, b, sfa, sfb, c, stream);
+}
+
+GemmStatus nvfp4_cute_batched_gemm_sm120(
+    int groups, int m, int n, int k, const void* a, const void* b,
+    const void* sfa, const void* sfb, half* c, cudaStream_t stream) {
+  return cute_gemm_detail::launch_nvfp4_cute_gemm_sm120(
+      groups, m, n, k, a, b, sfa, sfb,
+      reinterpret_cast<cute::half_t*>(c), stream);
+}
+
+GemmStatus nvfp4_cute_batched_gemm_f32_sm120(
+    int groups, int m, int n, int k, const void* a, const void* b,
+    const void* sfa, const void* sfb, float* c, cudaStream_t stream) {
+  return cute_gemm_detail::launch_nvfp4_cute_gemm_sm120(
+      groups, m, n, k, a, b, sfa, sfb, c, stream);
 }
 
 std::size_t nvfp4_gemm_workspace_size_sm120(

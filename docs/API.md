@@ -87,6 +87,162 @@ torch.ops.sm120_nvfp4.cute_gemm
 torch.ops.sm120_nvfp4.cutlass_gemm
 ```
 
+## Dense NVFP4 prefill attention
+
+Both matrix products use the repository-owned SM120 block-scaled MMA:
+
+```text
+logits = Q_nvfp4 @ K_nvfp4^T                  (FP32 output)
+P       = softmax(logits * softmax_scale)     (FP32)
+P_nvfp4 = dynamic_quantize(P, groups_of_16)   (E2M1 + UE4M3)
+output  = P_nvfp4 @ V_transposed_nvfp4^T      (FP16)
+output *= 1 / sum(dequantize(P_nvfp4), axis=N)
+```
+
+The final correction restores the probability-row normalization lost during
+E2M1 quantization. It does not remove relative per-element quantization error.
+
+Packed shapes and scale-region sizes per `(batch, head)` are:
+
+```text
+query              [B, H, M,  D/2]
+key                [B, H, N,  D/2]
+value_transposed   [B, H, Dv, N/2]
+query_scale        B*H * scale_a_elements(M, N,  D)
+key_scale          B*H * scale_b_elements(M, N,  D)
+value_scale        B*H * scale_b_elements(M, Dv, N)
+output             [B, H, M, Dv] float16
+```
+
+`value_transposed` stores rows of `V^T`, because the SM120 GEMM contract is
+`A[M,K] @ B[N,K]^T`. Constraints are `D % 32 == 0`, `N % 32 == 0`, and
+`Dv % 8 == 0`. With `causal=True`, `M <= N` and row `r` can see KV columns
+through `N-M+r`, matching suffix-aligned prefill semantics.
+
+```python
+workspace = torch.empty(
+    sm120_nvfp4.attention_workspace_bytes(B, H, M, N),
+    dtype=torch.uint8,
+    device=query.device,
+)
+output = sm120_nvfp4.attention_prefill(
+    query, key, value_transposed,
+    query_scale, key_scale, value_scale,
+    causal=True,
+    softmax_scale=D**-0.5,  # default when omitted
+    workspace=workspace,
+)
+```
+
+The C++ declarations are in `sm120_nvfp4/attention.hpp`. The workspace holds
+FP32 logits, packed probability payloads, probability scales and FP32 row
+corrections; the query function returns the exact required byte count.
+
+This implementation materializes logits and probabilities and launches GEMMs
+per `(B,H)` matrix. An end-to-end persistent/fused schedule is not yet part of
+the API.
+
+## Dense NVFP4 decode attention
+
+The decode entry point handles one query token per request and supports GQA
+and MQA without expanding the KV cache:
+
+```text
+query                    [B, Hq, D/2]
+key_cache                [B, Hkv, N, D/2]
+value_cache_transposed   [B, Hkv, Dv, N/2]
+kv_lengths               [B] int32 CUDA, optional
+output                   [B, Hq, Dv] float16
+```
+
+`Hq % Hkv == 0`. Consecutive groups of `Hq/Hkv` query heads directly reuse
+one KV head's packed payload and scales. `N` is padded cache capacity;
+`kv_lengths[b]` masks positions at or beyond the request's current length.
+When omitted, all `N` positions are valid.
+
+Scale sizes are:
+
+```text
+query_scale  B*Hq  * scale_a_elements(1, N,  D)
+key_scale    B*Hkv * scale_b_elements(1, N,  D)
+value_scale  B*Hkv * scale_b_elements(1, Dv, N)
+```
+
+```python
+workspace = torch.empty(
+    sm120_nvfp4.attention_decode_workspace_bytes(B, Hq, Hkv, N, D, Dv),
+    dtype=torch.uint8,
+    device=query.device,
+)
+output = sm120_nvfp4.attention_decode(
+    query, key_cache, value_cache_transposed,
+    query_scale, key_scale, value_scale,
+    kv_lengths=kv_lengths,
+    softmax_scale=D**-0.5,  # default when omitted
+    workspace=workspace,
+)
+```
+
+The decode kernel groups the `Hq/Hkv` query heads sharing one KV head into the
+M dimension and streams over 128-token KV tiles. Each tile performs native
+SM120 NVFP4 QK, online FP32 softmax, tile-local E2M1/UE4M3 probability
+quantization, and native NVFP4 PV before the tile storage is reused. No full
+`[B,Hq,N]` logits or probability tensor is written to global memory.
+
+For small request counts, the sequence is split across CTAs. Workspace holds
+only grouped query scales, FP32 `[B,Hq,splits,Dv]` partial outputs, and
+`[B,Hq,splits]` LSE values; a second kernel combines them stably. Packed K/V
+payloads remain unexpanded. Paged block tables and multi-token prediction are
+not part of this dense API.
+
+## Paged NVFP4 decode attention
+
+`attention_paged_decode` keeps the same single-token GQA/MQA and split-K
+semantics, but resolves logical tokens through a device block table:
+
+```text
+query                    [B, Hq, D/2]
+key_cache                [P, Hkv, S, D/2]
+value_cache_transposed   [P, Hkv, Dv, S/2]
+block_table              [B, max_blocks] int32 CUDA
+kv_lengths               [B] int32 CUDA
+output                   [B, Hq, Dv] float16
+```
+
+`S` is 32, 64, or 128 and `N = max_blocks * S`. Logical token `t` of
+request `b` comes from physical page `block_table[b,t//S]` at offset `t%S`.
+Entries covering the active `ceil(kv_lengths[b]/S)` pages must be in `[0,P)`.
+Physical pages may be shared or appear in any order.
+
+Each `(physical page, KV head)` owns an independent CUTLASS SFB region:
+
+```text
+query_scale  B*Hq  * scale_a_elements(1, N,  D)
+key_scale    P*Hkv * scale_b_elements(1, S,  D)
+value_scale  P*Hkv * scale_b_elements(1, Dv, S)
+```
+
+```python
+workspace = torch.empty(
+    sm120_nvfp4.attention_decode_workspace_bytes(B, Hq, Hkv, N, D, Dv),
+    dtype=torch.uint8,
+    device=query.device,
+)
+output = sm120_nvfp4.attention_paged_decode(
+    query, key_cache, value_cache_transposed,
+    query_scale, key_scale, value_scale,
+    block_table, kv_lengths,
+    softmax_scale=D**-0.5,
+    workspace=workspace,
+)
+```
+
+The CTA reads complete packed E2M1 byte pairs through the block table and
+places them directly in the existing swizzled QK/PV shared-memory tiles.
+This avoids expanding the cache to `[B,Hkv,N,*]`; online FP32 softmax,
+tile-local probability quantization, native SM120 NVFP4 QK/PV, and LSE
+combine are shared with dense decode.
+
 ## C++ Grouped GEMM
 
 The low-level asynchronous entry point is declared in `grouped_gemm.hpp`. It intentionally exposes scratch buffers because it performs no internal allocation or synchronization.

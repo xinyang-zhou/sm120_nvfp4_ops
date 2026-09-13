@@ -41,6 +41,18 @@ CUTE_HOST_DEVICE int64_t sfa_offset(
       layout(cute::make_coord(row, k_block * kNvfp4SFVectorSize, 0)));
 }
 
+// Return the byte offset of the scale for logical (column, k_block * 16) in
+// one independently stored SFB region.
+CUTE_HOST_DEVICE int64_t sfb_offset(
+    int column, int k_block, int logical_n, int logical_k) {
+  using ScaleConfig =
+      cutlass::detail::Sm1xxBlockScaledConfig<kNvfp4SFVectorSize>;
+  auto layout = ScaleConfig::tile_atom_to_shape_SFB(
+      cute::make_shape(1, logical_n, logical_k, 1));
+  return static_cast<int64_t>(layout(cute::make_coord(
+      column, k_block * kNvfp4SFVectorSize, 0)));
+}
+
 }  // namespace fused_moe
 }  // namespace sm120_nvfp4
 
