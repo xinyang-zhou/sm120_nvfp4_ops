@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 #include <cuda_runtime.h>
 
@@ -15,12 +16,15 @@ namespace cute_gemm_detail {
 
 using namespace cute;  // NOLINT
 
-template <typename Config>
+constexpr int kTmaStoreMinRows = 64;
+
+template <typename Config, typename TmaOutput, bool kUseTmaStore>
 __global__ void __launch_bounds__(384, 1) nvfp4_gemm_kernel(
     CUTLASS_GRID_CONSTANT typename Config::TmaX const tma_x,
     CUTLASS_GRID_CONSTANT typename Config::TmaW const tma_w,
     CUTLASS_GRID_CONSTANT typename Config::TmaSFA const tma_sfa,
     CUTLASS_GRID_CONSTANT typename Config::TmaSFB const tma_sfb,
+    CUTLASS_GRID_CONSTANT TmaOutput const tma_output,
     typename Config::Tout* output, int groups, int m, int n, int k) {
   using Tin = typename Config::Tin;
   using Tout = typename Config::Tout;
@@ -38,6 +42,11 @@ __global__ void __launch_bounds__(384, 1) nvfp4_gemm_kernel(
   constexpr int kTileK = Config::kTileK;
   constexpr int kStages = Config::kStage;
   constexpr int kMathThreads = size(TiledMma{});
+  using OutputSmemLayout = Layout<
+      Shape<Int<kTileM>, Int<kTileN>>,
+      Stride<Int<kTileN>, _1>>;
+  constexpr int kOutputSmemOffset =
+      (sizeof(TensorStorage) + 127) / 128 * 128;
   static_assert(kMathThreads == 256,
                 "SM120 cooperative NVFP4 MMA requires 256 math threads");
 
@@ -208,6 +217,15 @@ __global__ void __launch_bounds__(384, 1) nvfp4_gemm_kernel(
     auto identity = make_identity_tensor(shape(output_tile));
     auto output_coordinates = thread_mma.partition_C(identity);
 
+    auto output_tma_slice = tma_output.get_slice(0);
+    auto output_coordinates_mng = tma_output.get_tma_tensor(
+        make_shape(m, n, groups));
+    auto shared_output = make_tensor(
+        make_smem_ptr(reinterpret_cast<Tout*>(
+            shared_memory + kOutputSmemOffset)),
+        OutputSmemLayout{});
+    auto tma_shared_output = output_tma_slice.partition_S(shared_output);
+
     int read_stage = 0;
     int read_phase = 0;
 
@@ -260,15 +278,74 @@ __global__ void __launch_bounds__(384, 1) nvfp4_gemm_kernel(
 #pragma unroll
       for (int i = 0; i < size(accum); ++i) {
         auto coordinate = output_coordinates(i);
-        int row = tile_m * kTileM + get<0>(coordinate);
-        int column = tile_n * kTileN + get<1>(coordinate);
-        if (row < m && column < n) {
-          output[(static_cast<int64_t>(group) * m + row) * n + column] =
+        if constexpr (kUseTmaStore) {
+          shared_output(get<0>(coordinate), get<1>(coordinate)) =
               static_cast<Tout>(accum(i));
+        } else {
+          int row = tile_m * kTileM + get<0>(coordinate);
+          int column = tile_n * kTileN + get<1>(coordinate);
+          if (row < m && column < n) {
+            output[(static_cast<int64_t>(group) * m + row) * n + column] =
+                static_cast<Tout>(accum(i));
+          }
         }
+      }
+
+      if constexpr (kUseTmaStore) {
+        // All MMA threads first stage a dense FP16 tile in shared memory.
+        // The producer warpgroup can continue filling the disjoint mainloop
+        // buffers while TMA writes the epilogue tile to global memory.
+        cutlass::arch::fence_view_async_shared();
+        cutlass::arch::NamedBarrier::sync(
+            kMathThreads,
+            cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        if (thread_idx == 0) {
+          auto global_output = cute::local_tile(
+              output_coordinates_mng,
+              make_shape(Int<kTileM>{}, Int<kTileN>{}),
+              make_coord(tile_m, tile_n, group));
+          auto tma_global_output =
+              output_tma_slice.partition_D(global_output);
+          cute::copy(tma_output, tma_shared_output, tma_global_output);
+          cute::tma_store_arrive();
+          cute::tma_store_wait<0>();
+        }
+        // A single shared tile is reused across persistent work items, so do
+        // not let any consumer overwrite it before the TMA store completes.
+        cutlass::arch::NamedBarrier::sync(
+            kMathThreads,
+            cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
       }
     }
   }
+}
+
+template <typename Config, typename TmaOutput, bool kUseTmaStore>
+GemmStatus launch_kernel_specialization(
+    const typename Config::TmaBundle& tma, const TmaOutput& tma_output,
+    typename Config::Tout* output, int grid_size,
+    int groups, int m, int n, int k, cudaStream_t stream) {
+  constexpr int kThreads = 384;
+  constexpr int kOutputSmemOffset =
+      (Config::get_shm_size() + 127) / 128 * 128;
+  constexpr int kSharedMemoryBytes =
+      kUseTmaStore
+          ? kOutputSmemOffset +
+                Config::kTileM * Config::kTileN *
+                    sizeof(typename Config::Tout)
+          : Config::get_shm_size();
+  auto kernel = nvfp4_gemm_kernel<Config, TmaOutput, kUseTmaStore>;
+  if (cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          kSharedMemoryBytes) != cudaSuccess) {
+    return GemmStatus::kCudaError;
+  }
+  kernel<<<grid_size, kThreads, kSharedMemoryBytes, stream>>>(
+      tma.x, tma.w, tma.sfa, tma.sfb, tma_output,
+      output, groups, m, n, k);
+  return cudaPeekAtLastError() == cudaSuccess
+             ? GemmStatus::kSuccess
+             : GemmStatus::kCudaError;
 }
 
 bool valid_shape(int m, int n, int k) {
@@ -319,25 +396,41 @@ GemmStatus launch_nvfp4_cute_gemm_sm120(
   auto weight_scale = cute::make_tensor(
       reinterpret_cast<const Scale*>(sfb), layout_sfb);
   auto tma = config.get_tma(input, weight, input_scale, weight_scale);
+  using OutputSmemLayout = cute::Layout<
+      cute::Shape<cute::Int<Config::kTileM>, cute::Int<Config::kTileN>>,
+      cute::Stride<cute::Int<Config::kTileN>, cute::_1>>;
+  auto output = cute::make_tensor(
+      cute::make_gmem_ptr(c),
+      cute::make_shape(int32_t(m), int32_t(n), int32_t(groups)),
+      cute::make_stride(int64_t(n), cute::Int<1>{}, int64_t(m) * n));
+  auto tma_output = cute::make_tma_copy(
+      cute::SM90_TMA_STORE{}, output, OutputSmemLayout{},
+      cute::make_shape(cute::Int<Config::kTileM>{},
+                       cute::Int<Config::kTileN>{}),
+      cute::_1{});
 
   int tile_count = groups * cute::ceil_div(m, Config::kTileM) *
                    cute::ceil_div(n, Config::kTileN);
   int grid_size = std::min(properties.multiProcessorCount, tile_count);
-  constexpr int kThreads = 384;
-  constexpr int kSharedMemoryBytes = Config::get_shm_size();
-  auto kernel = cute_gemm_detail::nvfp4_gemm_kernel<Config>;
-  if (cudaFuncSetAttribute(
-          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-          kSharedMemoryBytes) != cudaSuccess) {
-    return GemmStatus::kCudaError;
+  constexpr bool kTmaOutputSupported =
+      std::is_same_v<Tout, cute::half_t>;
+  // Staging a complete 128x128 output tile has a fixed cost. Measurements on
+  // SM120 show that TMA wins from 64 valid rows onward, while scalar stores
+  // remain faster for the smaller decode-style M shapes.
+  bool use_tma_store =
+      kTmaOutputSupported && m >= cute_gemm_detail::kTmaStoreMinRows;
+  if constexpr (kTmaOutputSupported) {
+    if (use_tma_store) {
+      return cute_gemm_detail::launch_kernel_specialization<
+          Config, decltype(tma_output), true>(
+          tma, tma_output, reinterpret_cast<typename Config::Tout*>(c),
+          grid_size, groups, m, n, k, stream);
+    }
   }
-
-  kernel<<<grid_size, kThreads, kSharedMemoryBytes, stream>>>(
-      tma.x, tma.w, tma.sfa, tma.sfb,
-      reinterpret_cast<typename Config::Tout*>(c), groups, m, n, k);
-  return cudaPeekAtLastError() == cudaSuccess
-             ? GemmStatus::kSuccess
-             : GemmStatus::kCudaError;
+  return cute_gemm_detail::launch_kernel_specialization<
+      Config, decltype(tma_output), false>(
+      tma, tma_output, reinterpret_cast<typename Config::Tout*>(c),
+      grid_size, groups, m, n, k, stream);
 }
 
 }  // namespace cute_gemm_detail

@@ -20,6 +20,7 @@ Custom CuTe NVFP4 GEMM
 
 - 仓库自有 Custom CuTe 单 GEMM，不调用 CUTLASS `GemmUniversal` 或 `GemmUniversalAdapter`；
 - 显式实现 384-thread producer/consumer warp specialization、三阶段 TMA pipeline 和 persistent CTA tile scheduling；
+- FP16 epilogue 对不少于 64 行的问题使用 shared-memory staging 与 TMA store，小 M 保留低开销 predicated store；
 - 使用 `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X` 原生 block-scaled Tensor Core 指令；
 - dense prefill/decode attention 的 `QK^T` 和 `P@V` 都使用原生 NVFP4 MMA，softmax 保持 FP32，并校正量化后概率行和；
 - decode 支持单 token、GQA/MQA、GPU `kv_lengths`、paged KV block table
@@ -213,11 +214,13 @@ packed E2M1 tensor 可使用 `torch.uint8` 或 `torch.float4_e2m1fn_x2`。scale 
 | 16,4096,8192 | Custom CuTe | 25.2 us | 42.56 TFLOP/s | 104.34% |
 | 16,4096,8192 | CUTLASS reference | 26.2 us | 41.01 TFLOP/s | 100.49% |
 | 16,4096,8192 | cuBLASLt id 70 | 26.3 us | 40.81 TFLOP/s | 100% |
-| 512,4096,8192 | Custom CuTe | 34.8 us | 987.05 TFLOP/s | 85.56% |
-| 512,4096,8192 | CUTLASS reference | 28.3 us | 1215.47 TFLOP/s | 105.36% |
-| 512,4096,8192 | cuBLASLt id 70 | 29.8 us | 1153.62 TFLOP/s | 100% |
+| 512,4096,8192 | Custom CuTe | 28.4 us | 1208.39 TFLOP/s | 105.50% |
+| 512,4096,8192 | CUTLASS reference | 28.2 us | 1216.83 TFLOP/s | 106.24% |
+| 512,4096,8192 | cuBLASLt id 70 | 30.0 us | 1145.40 TFLOP/s | 100% |
 
-`M=16` 说明手写 mainloop 能降低通用 adapter 的固定开销；`M=512` 暴露了当前 scalar/predicated epilogue 与单一 tile 配置的不足。完整测量方法和历史 CUTLASS sweep 见 [Performance](docs/PERFORMANCE.md)。
+`M=16` 保留 scalar epilogue，以避免完整 TMA tile 的固定开销；`M=512`
+的 TMA-store epilogue 将 Custom CuTe 从修改前的 35.0 us 降至 28.4 us。
+完整测量方法和历史 CUTLASS sweep 见 [Performance](docs/PERFORMANCE.md)。
 
 单 token decode attention（`Hq=32`、`Hkv=8`、`N=1024`、
 `D=Dv=128`，30 次 warmup、300 次 CUDA Event 计时）：
@@ -254,7 +257,7 @@ NVLink/RDMA Kernel 性能；详细定义和原始数据见
 - decode 支持 GQA/MQA、动态有效长度、paged KV cache 和 split-K/LSE combine；尚未支持 MTP 或动态 device task map；
 - prefill 当前仍会 materialize FP32 logits 和 NVFP4 probability workspace；两种 decode 路径均融合 QK、在线 softmax 与 PV，不落地完整 logits/probability；
 - Custom CuTe 当前只有 `128 x 128 x 128`、3-stage 配置；
-- Custom CuTe epilogue 仍由线程直接写 global memory，尚未使用向量化 copy/TMA store；
+- Custom CuTe 的 FP32-output 路径及 `M < 64` 的 FP16 路径仍使用线程直接写回；其余 FP16 tile 使用 TMA store；
 - Grouped GEMM 要求所有 group 共享 N/K，M 由 `seqlens` 给出；
 - scale 必须预先转换为 SM1xx 物理布局；
 - Grouped GEMM 与完整路由版 Fused MoE binding 仍会分配部分临时 tensor；Expert-major 路径支持调用方 Workspace 复用；

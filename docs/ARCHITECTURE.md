@@ -42,9 +42,19 @@ The current specialization uses:
 - TMA loads for A, B, SFA and SFB;
 - one persistent grid capped by the number of resident SMs;
 - direct `cute::partition_*`, `cute::copy` and `cute::gemm` calls;
-- predicated FP32-accumulator to row-major FP16 stores.
+- a hybrid FP16 epilogue: shared-memory staging plus TMA store for
+  `M >= 64`, and predicated direct stores for smaller M.
 
 Each CTA advances through flattened `(tile_m,tile_n)` work in a grid-stride loop. The producer warp owns TMA issue and transaction barriers. The 256 math threads copy the packed payload/scales from shared memory, apply FP4 shifts, issue block-scaled MMA and publish each stage through consumer barriers.
+
+For the TMA epilogue, the math threads convert their FP32 accumulators into a
+dense row-major FP16 shared-memory tile. After a named-barrier and async-shared
+fence, one elected thread issues `SM90_TMA_STORE`; the producer warpgroup may
+continue filling the disjoint mainloop buffers. TensorMap bounds discard
+residue outside M/N. A second named-barrier prevents reuse of the single
+epilogue tile before the store completes. FP32 output, used by prefill logits,
+retains the direct predicated path because a full FP32 staging tile would
+exceed the useful shared-memory budget.
 
 `cuobjdump` confirms that this repository-owned kernel contains:
 

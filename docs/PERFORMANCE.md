@@ -29,25 +29,36 @@ Current measurements for `N=4096, K=8192`:
 | 16 | Custom CuTe | 25.2 us | 42.5665 | 104.3358% | 0 mismatches |
 | 16 | CUTLASS reference | 26.2 us | 41.0031 | 100.5037% | 0 mismatches |
 | 16 | cuBLASLt id 70 | 26.3 us | 40.7976 | 100% | reference |
-| 128 | Custom CuTe | 30.0 us | 286.7144 | 61.2723% | 0 mismatches |
-| 128 | CUTLASS reference | 26.4 us | 325.4973 | 69.5604% | 0 mismatches |
-| 128 | cuBLASLt id 70 | 18.4 us | 467.9348 | 100% | reference |
-| 512 | Custom CuTe | 34.8 us | 987.0538 | 85.5611% | 0 mismatches |
-| 512 | CUTLASS reference | 28.3 us | 1215.4651 | 105.3605% | 0 mismatches |
-| 512 | cuBLASLt id 70 | 29.8 us | 1153.6246 | 100% | reference |
+| 128 | Custom CuTe | 26.2 us | 327.7392 | 70.2297% | 0 mismatches |
+| 128 | CUTLASS reference | 26.4 us | 325.7989 | 69.8139% | 0 mismatches |
+| 128 | cuBLASLt id 70 | 18.4 us | 466.6673 | 100% | reference |
+| 512 | Custom CuTe | 28.4 us | 1208.3931 | 105.4995% | 0 mismatches |
+| 512 | CUTLASS reference | 28.2 us | 1216.8333 | 106.2364% | 0 mismatches |
+| 512 | cuBLASLt id 70 | 30.0 us | 1145.4020 | 100% | reference |
 
 Measurement counts:
 
 - M=16: 50 warmups, 500 iterations;
-- M=128: 30 warmups, 300 iterations;
-- M=512: 30 warmups, 200 iterations.
+- M=128: 50 warmups, 500 iterations;
+- M=512: 50 warmups, 300 iterations.
 
 Interpretation:
 
-- At M=16, the Custom CuTe path removes part of the generic adapter/scheduler overhead and reaches 104.34% of the selected cuBLASLt algorithm.
-- At M=128, cuBLASLt selects a 12 MiB-workspace candidate and is substantially faster than both repository paths.
-- At M=512, the CUTLASS reference remains strong while Custom CuTe reaches 85.56%; the current scalar/predicated epilogue and fixed one-CTA-per-output-tile scheduling are the primary optimization targets.
+- At M=16, the Custom CuTe path keeps its low-overhead predicated scalar
+  epilogue and reaches 104.34% of the selected cuBLASLt algorithm.
+- At M=128, the TMA-store epilogue reduces Custom CuTe latency from the prior
+  29.9 us scalar-store baseline to 26.2 us. cuBLASLt still wins by selecting a
+  12 MiB-workspace candidate.
+- At M=512, TMA store reduces Custom CuTe latency from 35.0 us to 28.4 us,
+  bringing it within 0.7% of the CUTLASS reference and to 105.50% of the
+  selected cuBLASLt algorithm.
 - Correctness is not inferred from matching aggregate statistics: every result element is compared, and Custom CuTe also matches the row-major CUTLASS reference exactly in these runs.
+
+The runtime keeps scalar stores for `M < 64`: staging an entire 128x128 tile
+made M=16 about 2% slower and M=32 about 1.6% slower. At M=64, TMA measured
+25.9 us versus 26.9 us for scalar stores, so 64 rows is the current measured
+crossover. This threshold is specific to the fixed 128x128 tile and should be
+revisited together with future shape autotuning.
 
 ## Historical CUTLASS-only sweep
 

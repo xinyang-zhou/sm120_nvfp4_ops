@@ -45,6 +45,40 @@ class GemmTest(unittest.TestCase):
         torch.testing.assert_close(default_output, cute_output, rtol=0, atol=0)
         torch.testing.assert_close(cutlass_output, cute_output, rtol=0, atol=0)
 
+    def test_tma_epilogue_partial_tile(self) -> None:
+        require_sm120()
+        # M=64 selects TMA for a partial tile. M=129 additionally exercises an
+        # extreme one-row TMA tail through the TensorMap OOB predicate.
+        n, k = 136, 128
+        for m in (64, 129):
+            with self.subTest(m=m):
+                a = torch.full(
+                    (m, k // 2), 0x22, dtype=torch.uint8, device="cuda"
+                )
+                b = torch.full(
+                    (n, k // 2), 0x22, dtype=torch.uint8, device="cuda"
+                )
+                sfa = torch.full(
+                    (sm120_nvfp4.scale_a_elements(m, n, k),),
+                    0x38,
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                sfb = torch.full(
+                    (sm120_nvfp4.scale_b_elements(m, n, k),),
+                    0x38,
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+
+                output = sm120_nvfp4.cute_gemm(a, b, sfa, sfb)
+                torch.cuda.synchronize()
+
+                expected = torch.full(
+                    (m, n), float(k), dtype=torch.float16, device="cuda"
+                )
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()
