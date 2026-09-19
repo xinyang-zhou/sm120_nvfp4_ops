@@ -56,7 +56,12 @@ sm120_nvfp4_ops/
 └── docs/                      # API、架构、性能与 roadmap
 ```
 
-原始开发目录 `sm120/`、`sm120_group_gemm/` 和 `sm120_fuse_moe/` 暂时保留用于实验回溯；公开仓库应以本目录为唯一源码树。
+本目录是项目唯一源码树；早期原型目录不属于当前仓库，也不参与构建、测试或性能数据生成。
+
+实现边界：`src/gemm/cute_gemm.cu` 和 `src/grouped_gemm/` 中的执行
+kernel 与调度逻辑由本仓库实现；CuTe/CUTLASS 提供 MMA atom、Tensor、TMA
+layout/copy 等底层 primitive；`src/gemm/cutlass_reference.cu` 只用于 reference，
+cuBLASLt 只用于 benchmark baseline，不属于默认执行路径。
 
 ## Requirements
 
@@ -90,6 +95,26 @@ cmake -S . -B build \
   -DPython3_EXECUTABLE="$(command -v python)"
 cmake --build build -j4
 ```
+
+生成可追溯的 GEMM/Grouped GEMM JSON 与 CSV：
+
+```bash
+mkdir -p benchmarks/results
+./scripts/benchmark.sh 16 4096 8192 \
+  --warmup 50 --iterations 500 --heuristics 16 \
+  --json benchmarks/results/gemm_rtx5090_YYYY-MM-DD.json \
+  --csv benchmarks/results/gemm_rtx5090_YYYY-MM-DD.csv
+
+./scripts/benchmark_grouped.sh 4 16 4096 8192 \
+  --warmup 50 --iterations 500 --heuristics 16 \
+  --json benchmarks/results/grouped_gemm_rtx5090_YYYY-MM-DD.json \
+  --csv benchmarks/results/grouped_gemm_rtx5090_YYYY-MM-DD.csv
+```
+
+JSON 是一次运行的完整记录；CSV 在文件已存在时追加数据行，适合 shape
+sweep。字段包含设备/CUDA/cuBLASLt 版本、计时方法、输入分布、heuristic、
+workspace、correctness 和原始命令。现有性能声明与原始产物状态见
+[结果索引](benchmarks/results/README.md)。
 
 不构建 PyTorch extension：
 
@@ -207,9 +232,12 @@ packed E2M1 tensor 可使用 `torch.uint8` 或 `torch.float4_e2m1fn_x2`。scale 
 
 ## Performance snapshot
 
-平台：RTX 5090、CUDA 13.2、cuBLASLt 13.4、CUTLASS 4.2.1。所有路径使用相同随机 packed E2M1 数据与 UE4M3 scale，并逐元素验证。
+平台：RTX 5090、CUDA 13.2、cuBLASLt 13.4、CUTLASS 4.2.1。以下是无
+profiler 的单 GEMM CUDA Event 结果；cuBLASLt 数字是给定搜索范围内最快的
+成功 heuristic，不代表所有 cuBLASLt 配置。所有路径使用相同随机 packed
+E2M1 数据与 UE4M3 scale，并逐元素验证。
 
-| M,N,K | Implementation | Latency | Throughput | vs cuBLASLt |
+| M,N,K | Implementation | Latency | Throughput | vs selected cuBLASLt heuristic |
 |---|---|---:|---:|---:|
 | 16,4096,8192 | Custom CuTe | 25.2 us | 42.56 TFLOP/s | 104.34% |
 | 16,4096,8192 | CUTLASS reference | 26.2 us | 41.01 TFLOP/s | 100.49% |
@@ -220,7 +248,9 @@ packed E2M1 tensor 可使用 `torch.uint8` 或 `torch.float4_e2m1fn_x2`。scale 
 
 `M=16` 保留 scalar epilogue，以避免完整 TMA tile 的固定开销；`M=512`
 的 TMA-store epilogue 将 Custom CuTe 从修改前的 35.0 us 降至 28.4 us。
-完整测量方法和历史 CUTLASS sweep 见 [Performance](docs/PERFORMANCE.md)。
+完整测量方法、证据状态和历史 CUTLASS sweep 见
+[Performance](docs/PERFORMANCE.md)。在新的结构化结果重新采集并入库前，
+这些历史手工记录数字不应直接作为简历中的可追溯结果。
 
 单 token decode attention（`Hq=32`、`Hkv=8`、`N=1024`、
 `D=Dv=128`，30 次 warmup、300 次 CUDA Event 计时）：
@@ -267,7 +297,8 @@ NVLink/RDMA Kernel 性能；详细定义和原始数据见
 下一步重点：
 
 - [ ] 为 `M=16/32/64` 与中大 M 分别增加 tile/stage specialization；
-- [ ] 用 vectorized shared-memory epilogue 或 TMA store 替换 scalar store；
+- [ ] 为 `M < 64` 评估 vectorized direct/shared-memory store；`M >= 64`
+  的 FP16 TMA-store 路径已经完成，不重复列为 TODO；
 - [ ] 增加 host-side shape dispatch 与离线 autotuning；
 - [x] 为 Expert-major 路径增加调用方 Workspace 和 MoE 元数据复用；
 - [x] 增加 Grouped GEMM 与双 GPU Fused MoE 对接的可复现 benchmark；

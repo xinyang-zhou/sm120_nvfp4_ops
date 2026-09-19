@@ -4,6 +4,12 @@
 
 Unless noted otherwise, results were measured on an idle NVIDIA GeForce RTX 5090 with CUDA 13.2, driver 595.84, cuBLASLt 13.4 and CUTLASS 4.2.1.
 
+Unless a section explicitly says otherwise, latency in this document is
+standalone operator/kernel latency measured without a profiler. It must not be
+read as model-level or end-to-end inference latency. The exact evidence status
+for every headline table is tracked in
+[the result index](../benchmarks/results/README.md).
+
 The current GEMM benchmark compares three independent paths:
 
 1. repository-owned Custom CuTe kernel;
@@ -35,6 +41,11 @@ Current measurements for `N=4096, K=8192`:
 | 512 | Custom CuTe | 28.4 us | 1208.3931 | 105.4995% | 0 mismatches |
 | 512 | CUTLASS reference | 28.2 us | 1216.8333 | 106.2364% | 0 mismatches |
 | 512 | cuBLASLt id 70 | 30.0 us | 1145.4020 | 100% | reference |
+
+These GEMM rows are retained historical measurements. They predate the
+structured writer, so the original JSON/CSV files are not present in the
+repository. Re-run the commands below and check in their generated artifacts
+before using the numbers as fully traceable resume evidence.
 
 Measurement counts:
 
@@ -117,7 +128,7 @@ PYTHONPATH="$PWD/build/python" \
 python benchmarks/benchmark_attention_decode.py \
   --batches 1,8 --block-sizes 32,64,128 \
   --warmup 30 --iterations 300 \
-  --output benchmarks/results/attention_decode.json
+  --output benchmarks/results/attention_decode_rtx5090_YYYY-MM-DD.json
 ```
 
 ## Generated instruction verification
@@ -153,6 +164,11 @@ For equal per-expert `M=16`, `N=4096`, `K=8192`:
 | 32 | 512 | 0.4322 | 1.1460 | 265.16% |
 
 These numbers include the custom grouped operator's per-call metadata/TensorMap setup. The loop excludes output concatenation but necessarily contains G GEMM launches. This answers “persistent grouped launch versus a loop of native GEMMs”; it is not a comparison with a native cuBLASLt grouped NVFP4 kernel.
+
+The grouped table likewise predates the structured writer and currently has no
+checked-in raw JSON/CSV. `benchmark_grouped_gemm_vs_cublaslt` now reproduces
+the same comparison scope: one persistent grouped invocation versus a timed
+loop containing one cuBLASLt launch per expert, with elementwise validation.
 
 ## DeepEP-compatible Fused MoE hand-off
 
@@ -199,24 +215,52 @@ torchrun --standalone --nproc-per-node=2 \
   benchmarks/benchmark_deepep_handoff.py \
   --tokens 256 --hidden 4096 --intermediate 2048 \
   --experts 32 --topk 2 --routing balanced \
-  --warmup 10 --iterations 100
+  --warmup 10 --iterations 100 \
+  > benchmarks/results/deepep_handoff_balanced_rtx5090_YYYY-MM-DD.json
 ```
 
-Use `--routing skewed` for the second row.
+Use `--routing skewed` and the corresponding `skewed` output filename for the
+second row. Reproduce the memcheck evidence with:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH="$PWD/build/python" \
+compute-sanitizer --tool memcheck \
+  python -m unittest \
+  tests.python.test_fused_moe.FusedMoeTest.test_expert_major_handoff_matches_reroute
+```
 
 ## Reproduction
 
 ```bash
 ./scripts/build.sh
 CUDA_VISIBLE_DEVICES=0 ./scripts/benchmark.sh \
-  16 4096 8192 --warmup 50 --iterations 500 --heuristics 16
+  16 4096 8192 --warmup 50 --iterations 500 --heuristics 16 \
+  --json benchmarks/results/gemm_rtx5090_YYYY-MM-DD.json \
+  --csv benchmarks/results/gemm_rtx5090_YYYY-MM-DD.csv
 ```
 
 Representative M=512 command:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 ./scripts/benchmark.sh \
-  512 4096 8192 --warmup 30 --iterations 200 --heuristics 16
+  512 4096 8192 --warmup 50 --iterations 300 --heuristics 16 \
+  --json benchmarks/results/gemm_m512_rtx5090_YYYY-MM-DD.json \
+  --csv benchmarks/results/gemm_rtx5090_YYYY-MM-DD.csv
 ```
 
-Always record clocks/power mode, driver, CUDA, cuBLASLt, CUTLASS commit and GPU occupancy conditions when publishing results.
+Representative Grouped GEMM command:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./scripts/benchmark_grouped.sh \
+  4 16 4096 8192 --warmup 50 --iterations 500 --heuristics 16 \
+  --json benchmarks/results/grouped_gemm_g4_rtx5090_YYYY-MM-DD.json \
+  --csv benchmarks/results/grouped_gemm_rtx5090_YYYY-MM-DD.csv
+```
+
+`--json` writes one complete run and `--csv` appends one row, so a suite can
+share one CSV while keeping an immutable JSON per shape. The benchmark records
+the GPU, CUDA runtime/driver-API version, cuBLASLt version, stream, timing parameters,
+input distribution, selected heuristic/workspace, correctness and command.
+CUTLASS source revision, clocks/power mode and whether the GPU was otherwise
+idle remain external experiment metadata and must be recorded alongside the
+result files before publication.

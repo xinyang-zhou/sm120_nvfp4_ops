@@ -124,18 +124,18 @@ and a second native NVFP4 MMA accumulates PV. The same 64 KiB shared-memory
 region is reused for Q/K storage and the temporary logits tile, so neither
 full logits nor full probabilities reach global memory.
 
-Low-occupancy requests split the KV sequence across CTAs, following Tencent's
-LSE-combine idea. Each split writes only an output-sized FP32 partial and one
+Low-occupancy requests split the KV sequence across CTAs and use a stable
+LSE-weighted combine. Each split writes only an output-sized FP32 partial and one
 LSE per query head; a small combine kernel applies stable LSE weights. GQA/MQA
 reuses packed K/V without expansion. Per-head query scales are repacked into
 grouped tiles in reusable workspace. Device `kv_lengths[B]` supplies the last
 valid position without host synchronization.
 
-Tencent's SM90 WGMMA schedule is not directly portable, but its online
-softmax and split-K/LSE organization carries over. This SM120 implementation
-uses block-scaled `OMMA.SF` for both QK and PV.
+The SM120 implementation organizes online softmax and split-K/LSE around
+block-scaled `OMMA.SF` for both QK and PV; it does not reuse an SM90 WGMMA
+schedule.
 
-The paged entry point adds Tencent-style block-table indirection without
+The paged entry point adds block-table indirection without
 materializing a dense cache. Physical caches are `[P,Hkv,S,D]` for K and
 `[P,Hkv,Dv,S]` for transposed V, with `S` equal to 32, 64, or 128. A CTA maps
 each logical 128-token tile to its physical pages, loads complete packed E2M1

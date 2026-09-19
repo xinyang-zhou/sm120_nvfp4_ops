@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "benchmark_io.hpp"
 #include "sm120_nvfp4/gemm.hpp"
 
 namespace {
@@ -28,6 +29,9 @@ struct Options {
   int iterations = 500;
   int heuristic_count = 16;
   std::size_t workspace_bytes = 64ull << 20;
+  std::string json_path;
+  std::string csv_path;
+  std::string command;
 };
 
 const char* cublas_status_string(cublasStatus_t status) {
@@ -107,6 +111,8 @@ void print_usage(const char* program) {
       << "  --iterations N      measured launches (default: 500)\n"
       << "  --heuristics N      cuBLASLt candidates to request (default: 16)\n"
       << "  --workspace-mib N   cuBLASLt workspace limit (default: 64)\n"
+      << "  --json PATH         write one self-contained JSON result\n"
+      << "  --csv PATH          append one flat result row to CSV\n"
       << "  --help              show this message\n";
 }
 
@@ -139,6 +145,10 @@ Options parse_options(int argc, char** argv) {
       int mib = parse_nonnegative_int(
           next_value("--workspace-mib"), "workspace-mib");
       options.workspace_bytes = static_cast<std::size_t>(mib) << 20;
+    } else if (arg == "--json") {
+      options.json_path = next_value("--json");
+    } else if (arg == "--csv") {
+      options.csv_path = next_value("--csv");
     } else if (!arg.empty() && arg[0] == '-') {
       throw std::invalid_argument("unknown option: " + arg);
     } else {
@@ -321,10 +331,149 @@ ValidationStats compare_row_major_outputs(
   return stats;
 }
 
+void write_structured_results(
+    const Options& options, const cudaDeviceProp& properties,
+    int cuda_runtime_version, int cuda_driver_version,
+    std::size_t cublaslt_version, int heuristic_results,
+    int selected_index, int selected_algorithm_id,
+    std::size_t selected_workspace_bytes, int tune_iterations,
+    float cute_ms, float cutlass_ms, float cublas_ms,
+    const ValidationStats& cublas_validation,
+    const ValidationStats& cutlass_validation) {
+  using sm120_nvfp4_benchmark::append_csv_row;
+  using sm120_nvfp4_benchmark::csv_escape;
+  using sm120_nvfp4_benchmark::json_escape;
+  using sm120_nvfp4_benchmark::json_number;
+  using sm120_nvfp4_benchmark::utc_timestamp;
+  using sm120_nvfp4_benchmark::write_text_file;
+
+  const std::string timestamp = utc_timestamp();
+  const bool passed = cublas_validation.mismatches == 0 &&
+                      cutlass_validation.mismatches == 0;
+  const double cute_tflops =
+      tflops(options.m, options.n, options.k, cute_ms);
+  const double cutlass_tflops =
+      tflops(options.m, options.n, options.k, cutlass_ms);
+  const double cublas_tflops =
+      tflops(options.m, options.n, options.k, cublas_ms);
+  const double cute_percent = 100.0 * cute_tflops / cublas_tflops;
+  const double cutlass_percent = 100.0 * cutlass_tflops / cublas_tflops;
+
+  if (!options.json_path.empty()) {
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(9)
+         << "{\n"
+         << "  \"schema_version\": 1,\n"
+         << "  \"benchmark\": \"gemm\",\n"
+         << "  \"timestamp_utc\": \"" << timestamp << "\",\n"
+         << "  \"status\": \"" << (passed ? "PASS" : "FAIL") << "\",\n"
+         << "  \"command\": \"" << json_escape(options.command) << "\",\n"
+         << "  \"environment\": {\n"
+         << "    \"device_index\": " << options.device << ",\n"
+         << "    \"device_name\": \"" << json_escape(properties.name) << "\",\n"
+         << "    \"compute_capability\": \"" << properties.major << '.'
+         << properties.minor << "\",\n"
+         << "    \"sm_count\": " << properties.multiProcessorCount << ",\n"
+         << "    \"cuda_runtime_version\": " << cuda_runtime_version << ",\n"
+         << "    \"cuda_driver_api_version\": " << cuda_driver_version << ",\n"
+         << "    \"cublaslt_version\": " << cublaslt_version << "\n"
+         << "  },\n"
+         << "  \"shape\": {\"m\": " << options.m << ", \"n\": "
+         << options.n << ", \"k\": " << options.k << "},\n"
+         << "  \"measurement\": {\n"
+         << "    \"warmup\": " << options.warmup << ",\n"
+         << "    \"iterations\": " << options.iterations << ",\n"
+         << "    \"timer\": \"CUDA events\",\n"
+         << "    \"stream\": \"dedicated non-default stream\",\n"
+         << "    \"input_distribution\": \"mt19937 uniform packed bytes; seeds 0x120a/0xc0b1a5; UE4M3 scales 0x38\"\n"
+         << "  },\n"
+         << "  \"cublaslt_search\": {\n"
+         << "    \"requested_candidates\": " << options.heuristic_count << ",\n"
+         << "    \"returned_candidates\": " << heuristic_results << ",\n"
+         << "    \"selected_index\": " << selected_index << ",\n"
+         << "    \"selected_algorithm_id\": " << selected_algorithm_id << ",\n"
+         << "    \"tune_warmup\": 3,\n"
+         << "    \"tune_iterations\": " << tune_iterations << ",\n"
+         << "    \"workspace_limit_bytes\": " << options.workspace_bytes << ",\n"
+         << "    \"selected_workspace_bytes\": "
+         << selected_workspace_bytes << "\n"
+         << "  },\n"
+         << "  \"results\": {\n"
+         << "    \"custom_cute\": {\"latency_ms\": " << json_number(cute_ms)
+         << ", \"tflops\": " << json_number(cute_tflops)
+         << ", \"percent_of_cublaslt\": " << json_number(cute_percent) << "},\n"
+         << "    \"cutlass_reference\": {\"latency_ms\": " << json_number(cutlass_ms)
+         << ", \"tflops\": " << json_number(cutlass_tflops)
+         << ", \"percent_of_cublaslt\": " << json_number(cutlass_percent) << "},\n"
+         << "    \"cublaslt\": {\"latency_ms\": " << json_number(cublas_ms)
+         << ", \"tflops\": " << json_number(cublas_tflops) << "}\n"
+         << "  },\n"
+         << "  \"correctness\": {\n"
+         << "    \"absolute_tolerance\": 0.5,\n"
+         << "    \"relative_tolerance\": 0.001,\n"
+         << "    \"custom_vs_cublaslt\": {\"mismatches\": "
+         << cublas_validation.mismatches << ", \"max_abs_error\": "
+         << json_number(cublas_validation.max_absolute_error)
+         << ", \"max_rel_error\": "
+         << json_number(cublas_validation.max_relative_error) << "},\n"
+         << "    \"custom_vs_cutlass\": {\"mismatches\": "
+         << cutlass_validation.mismatches << ", \"max_abs_error\": "
+         << json_number(cutlass_validation.max_absolute_error)
+         << ", \"max_rel_error\": "
+         << json_number(cutlass_validation.max_relative_error) << "}\n"
+         << "  }\n"
+         << "}\n";
+    write_text_file(options.json_path, json.str());
+  }
+
+  if (!options.csv_path.empty()) {
+    const std::string header =
+        "timestamp_utc,benchmark,status,command,device_index,device_name,"
+        "compute_capability,sm_count,cuda_runtime_version,cuda_driver_api_version,"
+        "cublaslt_version,m,n,k,warmup,iterations,timer,stream,input_distribution,"
+        "heuristics_requested,heuristics_returned,selected_index,algo_id,"
+        "algo_workspace_bytes,workspace_limit_bytes,cute_ms,cute_tflops,"
+        "cutlass_ms,cutlass_tflops,cublaslt_ms,cublaslt_tflops,"
+        "cute_percent_of_cublaslt,cutlass_percent_of_cublaslt,"
+        "cute_vs_cublaslt_mismatches,cute_vs_cublaslt_max_abs_error,"
+        "cute_vs_cublaslt_max_rel_error,cute_vs_cutlass_mismatches,"
+        "cute_vs_cutlass_max_abs_error,cute_vs_cutlass_max_rel_error";
+    std::ostringstream row;
+    row << std::fixed << std::setprecision(9)
+        << timestamp << ",gemm," << (passed ? "PASS" : "FAIL") << ','
+        << csv_escape(options.command) << ',' << options.device << ','
+        << csv_escape(properties.name) << ',' << properties.major << '.'
+        << properties.minor << ',' << properties.multiProcessorCount << ','
+        << cuda_runtime_version << ',' << cuda_driver_version << ','
+        << cublaslt_version << ',' << options.m << ',' << options.n << ','
+        << options.k << ',' << options.warmup << ',' << options.iterations
+        << ",CUDA events,dedicated non-default stream,"
+        << csv_escape("mt19937 uniform packed bytes; seeds 0x120a/0xc0b1a5; UE4M3 scales 0x38")
+        << ',' << options.heuristic_count << ',' << heuristic_results << ','
+        << selected_index << ',' << selected_algorithm_id << ','
+        << selected_workspace_bytes << ',' << options.workspace_bytes << ','
+        << cute_ms << ',' << cute_tflops << ',' << cutlass_ms << ','
+        << cutlass_tflops << ',' << cublas_ms << ',' << cublas_tflops << ','
+        << cute_percent << ',' << cutlass_percent << ','
+        << cublas_validation.mismatches << ','
+        << cublas_validation.max_absolute_error << ','
+        << cublas_validation.max_relative_error << ','
+        << cutlass_validation.mismatches << ','
+        << cutlass_validation.max_absolute_error << ','
+        << cutlass_validation.max_relative_error;
+    append_csv_row(options.csv_path, header, row.str());
+  }
+}
+
 int run(const Options& options) {
   CUDA_CHECK(cudaSetDevice(options.device));
   cudaDeviceProp properties{};
   CUDA_CHECK(cudaGetDeviceProperties(&properties, options.device));
+  int cuda_runtime_version = 0;
+  int cuda_driver_version = 0;
+  CUDA_CHECK(cudaRuntimeGetVersion(&cuda_runtime_version));
+  CUDA_CHECK(cudaDriverGetVersion(&cuda_driver_version));
+  const std::size_t cublaslt_version = cublasLtGetVersion();
   if (properties.major != 12 || properties.minor != 0) {
     throw std::runtime_error("the selected device is not SM120");
   }
@@ -550,10 +699,14 @@ int run(const Options& options) {
     double percent_of_cublas = 100.0 * cute_tflops / cublas_tflops;
     double cutlass_percent_of_cublas =
         100.0 * cutlass_tflops / cublas_tflops;
+    const int selected_algorithm_id =
+        algorithm_id(heuristics[selected_index].algo);
+    const std::size_t selected_workspace_bytes =
+        heuristics[selected_index].workspaceSize;
 
     std::cout << std::fixed << std::setprecision(4)
               << "\nSelected cuBLASLt algorithm: id="
-              << algorithm_id(heuristics[selected_index].algo)
+              << selected_algorithm_id
               << ", heuristic_index=" << selected_index
               << ", workspace=" << heuristics[selected_index].workspaceSize
               << " bytes, returned_candidates=" << heuristic_results << '\n'
@@ -584,8 +737,20 @@ int run(const Options& options) {
               << ',' << cutlass_tflops << ',' << cutlass_percent_of_cublas
               << ',' << cublas_ms
               << ',' << cublas_tflops << ',' << percent_of_cublas << ','
-              << algorithm_id(heuristics[selected_index].algo) << ','
+              << selected_algorithm_id << ','
               << validation.mismatches << ',' << cutlass_validation.mismatches << '\n';
+
+    write_structured_results(
+        options, properties, cuda_runtime_version, cuda_driver_version,
+        cublaslt_version, heuristic_results, selected_index,
+        selected_algorithm_id, selected_workspace_bytes, tune_iterations,
+        cute_ms, cutlass_ms, cublas_ms, validation, cutlass_validation);
+    if (!options.json_path.empty()) {
+      std::cout << "JSON result: " << options.json_path << '\n';
+    }
+    if (!options.csv_path.empty()) {
+      std::cout << "CSV result: " << options.csv_path << '\n';
+    }
 
     CUDA_CHECK(cudaStreamDestroy(stream));
     return validation.mismatches == 0 && cutlass_validation.mismatches == 0
@@ -600,7 +765,9 @@ int run(const Options& options) {
 
 int main(int argc, char** argv) {
   try {
-    return run(parse_options(argc, argv));
+    Options options = parse_options(argc, argv);
+    options.command = sm120_nvfp4_benchmark::command_line(argc, argv);
+    return run(options);
   } catch (const std::exception& error) {
     std::cerr << "Error: " << error.what() << '\n';
     return EXIT_FAILURE;

@@ -129,6 +129,14 @@ if(SM120_NVFP4_BUILD_BENCHMARKS)
     benchmark_gemm_vs_cublaslt PRIVATE sm120_nvfp4_gemm CUDA::cublasLt)
 
   add_executable(
+    benchmark_grouped_gemm_vs_cublaslt
+    benchmarks/benchmark_grouped_gemm_vs_cublaslt.cu)
+  sm120_nvfp4_configure_target(benchmark_grouped_gemm_vs_cublaslt)
+  target_link_libraries(
+    benchmark_grouped_gemm_vs_cublaslt
+    PRIVATE sm120_nvfp4_grouped_gemm CUDA::cublasLt)
+
+  add_executable(
     probe_cublaslt_grouped benchmarks/probe_cublaslt_grouped.cu)
   target_link_libraries(probe_cublaslt_grouped PRIVATE CUDA::cublasLt CUDA::cudart)
   target_compile_options(probe_cublaslt_grouped PRIVATE
