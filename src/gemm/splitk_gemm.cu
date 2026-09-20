@@ -418,7 +418,7 @@ GemmStatus launch(
       (output_elements + kReductionThreads - 1) / kReductionThreads;
   const int reduction_blocks = static_cast<int>(std::min<int64_t>(
       required_reduction_blocks,
-      static_cast<int64_t>(properties.multiProcessorCount) * 6));
+      static_cast<int64_t>(properties.multiProcessorCount) * 4));
   reduce_splitk_kernel<<<
       reduction_blocks, kReductionThreads, 0, stream>>>(
       static_cast<const float*>(workspace), output,
