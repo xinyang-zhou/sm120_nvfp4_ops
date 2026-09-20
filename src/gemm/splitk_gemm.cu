@@ -25,16 +25,17 @@ constexpr int kTileK = 128;
 constexpr int kStages = 3;
 constexpr int kThreads = 384;
 constexpr int kReductionThreads = 256;
+constexpr int kPartialStoreRows = 64;
 
 using Config = detail::Nvfp4GemmConfig<float, kTileM, kTileN, kTileK, kStages>;
 
-template <typename GemmConfig>
+template <typename GemmConfig, typename TmaPartialOutput>
 __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaX const tma_x,
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaW const tma_w,
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaSFA const tma_sfa,
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaSFB const tma_sfb,
-    float* partial_output,
+    CUTLASS_GRID_CONSTANT TmaPartialOutput const tma_partial_output,
     int groups, int m, int n, int k, int split_k) {
   using TiledMma = typename GemmConfig::TiledMma;
   using CollectiveMainloop = typename GemmConfig::CollectiveMainloop;
@@ -49,8 +50,15 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
   constexpr int kConfigTileK = GemmConfig::kTileK;
   constexpr int kConfigStages = GemmConfig::kStage;
   constexpr int kMathThreads = size(TiledMma{});
+  using PartialOutputSmemLayout = Layout<
+      Shape<Int<kPartialStoreRows>, Int<kConfigTileN>>,
+      Stride<Int<kConfigTileN>, _1>>;
+  constexpr int kPartialOutputSmemOffset =
+      (sizeof(TensorStorage) + 127) / 128 * 128;
   static_assert(kMathThreads == 256,
                 "SM120 cooperative NVFP4 MMA requires 256 math threads");
+  static_assert(kConfigTileM % kPartialStoreRows == 0,
+                "The partial-output tile must split evenly into TMA stores");
 
   const int thread_idx = threadIdx.x;
   const int elected = cute::elect_one_sync();
@@ -107,8 +115,6 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
   const int tiles_per_group = tile_count_m * tile_count_n;
   const int output_tile_count = groups * tiles_per_group;
   const int task_count = output_tile_count * split_k;
-  const int64_t output_elements =
-      static_cast<int64_t>(groups) * m * n;
 
   if (thread_idx >= kMathThreads) {
     cutlass::arch::warpgroup_reg_dealloc<24>();
@@ -226,6 +232,16 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
     auto identity = make_identity_tensor(shape(output_tile));
     auto output_coordinates = thread_mma.partition_C(identity);
 
+    auto partial_output_tma_slice = tma_partial_output.get_slice(0);
+    auto partial_output_coordinates = tma_partial_output.get_tma_tensor(
+        make_shape(m, n, groups * split_k));
+    auto shared_partial_output = make_tensor(
+        make_smem_ptr(reinterpret_cast<float*>(
+            shared_memory + kPartialOutputSmemOffset)),
+        PartialOutputSmemLayout{});
+    auto tma_shared_partial_output =
+        partial_output_tma_slice.partition_S(shared_partial_output);
+
     int read_stage = 0;
     int read_phase = 0;
 
@@ -279,17 +295,46 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
         }
       }
 
+      constexpr int kPartialStoreCount =
+          kConfigTileM / kPartialStoreRows;
+      // A full FP32 128x128 tile would require 64 KiB of staging storage.
+      // Stage two 64-row slabs through the same 32 KiB buffer instead.
 #pragma unroll
-      for (int i = 0; i < size(accum); ++i) {
-        auto coordinate = output_coordinates(i);
-        const int row = tile_m * kConfigTileM + get<0>(coordinate);
-        const int column = tile_n * kConfigTileN + get<1>(coordinate);
-        if (row < m && column < n) {
-          const int64_t output_index =
-              (static_cast<int64_t>(group) * m + row) * n + column;
-          partial_output[static_cast<int64_t>(split) * output_elements +
-                         output_index] = static_cast<float>(accum(i));
+      for (int store = 0; store < kPartialStoreCount; ++store) {
+#pragma unroll
+        for (int i = 0; i < size(accum); ++i) {
+          auto coordinate = output_coordinates(i);
+          const int local_row = get<0>(coordinate);
+          if (local_row / kPartialStoreRows == store) {
+            shared_partial_output(
+                local_row - store * kPartialStoreRows,
+                get<1>(coordinate)) = static_cast<float>(accum(i));
+          }
         }
+
+        cutlass::arch::fence_view_async_shared();
+        cutlass::arch::NamedBarrier::sync(
+            kMathThreads,
+            cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        if (thread_idx == 0) {
+          auto global_partial_output = cute::local_tile(
+              partial_output_coordinates,
+              make_shape(Int<kPartialStoreRows>{},
+                         Int<kConfigTileN>{}),
+              make_coord(
+                  tile_m * kPartialStoreCount + store,
+                  tile_n, group + split * groups));
+          auto tma_global_partial_output =
+              partial_output_tma_slice.partition_D(global_partial_output);
+          cute::copy(
+              tma_partial_output, tma_shared_partial_output,
+              tma_global_partial_output);
+          cute::tma_store_arrive();
+          cute::tma_store_wait<0>();
+        }
+        cutlass::arch::NamedBarrier::sync(
+            kMathThreads,
+            cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
       }
     }
   }
@@ -391,14 +436,37 @@ GemmStatus launch(
   auto weight_scale = cute::make_tensor(
       reinterpret_cast<const typename Config::TS*>(sfb), layout_sfb);
   auto tma = config.get_tma(input, weight, input_scale, weight_scale);
+  // Flatten (split, group) into one batch coordinate while preserving the
+  // workspace layout [split][group][m][n].
+  using PartialOutputSmemLayout = cute::Layout<
+      cute::Shape<cute::Int<kPartialStoreRows>,
+                  cute::Int<Config::kTileN>>,
+      cute::Stride<cute::Int<Config::kTileN>, cute::_1>>;
+  auto partial_output = cute::make_tensor(
+      cute::make_gmem_ptr(static_cast<float*>(workspace)),
+      cute::make_shape(
+          int32_t(m), int32_t(n), int32_t(groups * split_k)),
+      cute::make_stride(
+          int64_t(n), cute::Int<1>{}, int64_t(m) * n));
+  auto tma_partial_output = cute::make_tma_copy(
+      cute::SM90_TMA_STORE{}, partial_output,
+      PartialOutputSmemLayout{},
+      cute::make_shape(cute::Int<kPartialStoreRows>{},
+                       cute::Int<Config::kTileN>{}),
+      cute::_1{});
 
   const int tile_count =
       groups * cute::ceil_div(m, Config::kTileM) *
       cute::ceil_div(n, Config::kTileN);
   const int task_count = tile_count * split_k;
   const int grid_size = std::min(properties.multiProcessorCount, task_count);
-  auto partial_kernel = nvfp4_splitk_partial_kernel<Config>;
-  constexpr int kSharedMemoryBytes = Config::get_shm_size();
+  auto partial_kernel =
+      nvfp4_splitk_partial_kernel<Config, decltype(tma_partial_output)>;
+  constexpr int kPartialOutputSmemOffset =
+      (Config::get_shm_size() + 127) / 128 * 128;
+  constexpr int kSharedMemoryBytes =
+      kPartialOutputSmemOffset +
+      kPartialStoreRows * Config::kTileN * sizeof(float);
   if (cudaFuncSetAttribute(
           partial_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
           kSharedMemoryBytes) != cudaSuccess) {
@@ -406,8 +474,8 @@ GemmStatus launch(
   }
 
   partial_kernel<<<grid_size, kThreads, kSharedMemoryBytes, stream>>>(
-      tma.x, tma.w, tma.sfa, tma.sfb,
-      static_cast<float*>(workspace), groups, m, n, k, split_k);
+      tma.x, tma.w, tma.sfa, tma.sfb, tma_partial_output,
+      groups, m, n, k, split_k);
   if (cudaPeekAtLastError() != cudaSuccess) {
     return GemmStatus::kCudaError;
   }
