@@ -9,9 +9,9 @@
 
 namespace sm120_nvfp4::m256_experiment {
 
-// Specialized experimental path for M=256 and split_k=2.  It intentionally
-// lives outside the public API and is not selected by the default GEMM
-// dispatcher.  Other M or split_k values are rejected.
+// Specialized experimental path for groups=1, M=256, and split_k=2.  It
+// intentionally lives outside the public API and is not selected by the
+// default GEMM dispatcher.  Other groups, M, or split_k values are rejected.
 //
 // Workspace layout is split-major FP32:
 //   [split_k, groups, m, n]

@@ -47,7 +47,7 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaSFA const tma_sfa,
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaSFB const tma_sfb,
     CUTLASS_GRID_CONSTANT TmaPartialOutput const tma_partial_output,
-    int groups, int n, int k) {
+    int n, int k) {
   using TiledMma = typename GemmConfig::TiledMma;
   using CollectiveMainloop = typename GemmConfig::CollectiveMainloop;
   using TensorStorage = typename GemmConfig::TensorStorage;
@@ -63,6 +63,7 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
   constexpr int kMathThreads = size(TiledMma{});
   constexpr int kPartialStoreCount =
       kConfigTileM / kPartialStoreRows;
+  constexpr int groups = 1;
   constexpr int m = kSpecializedM;
   constexpr int split_k = kSpecializedSplitK;
   constexpr int kPartialOutputSmemOffset =
@@ -146,8 +147,8 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
            flat_task += gridDim.x) {
         const int flat_tile = flat_task / split_k;
         const int split = flat_task % split_k;
-        const int group = flat_tile / tiles_per_group;
-        const int local_tile = flat_tile % tiles_per_group;
+        constexpr int group = 0;
+        const int local_tile = flat_tile;
         const int tile_m = local_tile / tile_count_n;
         const int tile_n = local_tile % tile_count_n;
         const int tile_k_begin = tile_count_k * split / split_k;
@@ -287,8 +288,8 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
          flat_task += gridDim.x) {
       const int flat_tile = flat_task / split_k;
       const int split = flat_task % split_k;
-      const int group = flat_tile / tiles_per_group;
-      const int local_tile = flat_tile % tiles_per_group;
+      constexpr int group = 0;
+      const int local_tile = flat_tile;
       const int tile_m = local_tile / tile_count_n;
       const int tile_n = local_tile % tile_count_n;
       const int tile_k_begin = tile_count_k * split / split_k;
@@ -390,7 +391,7 @@ __global__ void reduce_m256_split2_half2_kernel(
 }
 
 bool valid_shape(int groups, int m, int n, int k, int split_k) {
-  if (groups <= 0 || m != kSpecializedM || n <= 0 || k <= 0 ||
+  if (groups != 1 || m != kSpecializedM || n <= 0 || k <= 0 ||
       split_k != kSpecializedSplitK ||
       (k % kInputAlignmentElements) != 0 ||
       (n % kOutputAlignmentElements) != 0) {
@@ -505,7 +506,7 @@ GemmStatus launch(
 
   partial_kernel<<<grid_size, kThreads, kSharedMemoryBytes, stream>>>(
       tma.x, tma.w, tma.sfa, tma.sfb, tma_partial_output,
-      groups, n, k);
+      n, k);
   if (cudaPeekAtLastError() != cudaSuccess) {
     return GemmStatus::kCudaError;
   }
