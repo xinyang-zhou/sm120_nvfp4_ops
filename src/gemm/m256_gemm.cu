@@ -47,7 +47,7 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaSFA const tma_sfa,
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaSFB const tma_sfb,
     CUTLASS_GRID_CONSTANT TmaPartialOutput const tma_partial_output,
-    int groups, int m, int n, int k, int split_k) {
+    int groups, int n, int k) {
   using TiledMma = typename GemmConfig::TiledMma;
   using CollectiveMainloop = typename GemmConfig::CollectiveMainloop;
   using TensorStorage = typename GemmConfig::TensorStorage;
@@ -63,6 +63,8 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
   constexpr int kMathThreads = size(TiledMma{});
   constexpr int kPartialStoreCount =
       kConfigTileM / kPartialStoreRows;
+  constexpr int m = kSpecializedM;
+  constexpr int split_k = kSpecializedSplitK;
   constexpr int kPartialOutputSmemOffset =
       (sizeof(TensorStorage) + 127) / 128 * 128;
   static_assert(kMathThreads == 256,
@@ -503,7 +505,7 @@ GemmStatus launch(
 
   partial_kernel<<<grid_size, kThreads, kSharedMemoryBytes, stream>>>(
       tma.x, tma.w, tma.sfa, tma.sfb, tma_partial_output,
-      groups, m, n, k, split_k);
+      groups, n, k);
   if (cudaPeekAtLastError() != cudaSuccess) {
     return GemmStatus::kCudaError;
   }
