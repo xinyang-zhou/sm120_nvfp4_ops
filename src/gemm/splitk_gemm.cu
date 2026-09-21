@@ -9,6 +9,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "cute/atom/copy_traits_sm90.hpp"
+#include "cute/atom/mma_traits_sm90_gmma.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/arch/reg_reconfig.h"
@@ -28,6 +30,13 @@ constexpr int kReductionThreads = 256;
 constexpr int kPartialStoreRows = 64;
 
 using Config = detail::Nvfp4GemmConfig<float, kTileM, kTileN, kTileK, kStages>;
+using PartialOutputSmemLayout = decltype(tile_to_shape(
+    GMMA::Layout_K_SW128_Atom<float>{},
+    Shape<Int<kPartialStoreRows>, Int<kTileN>>{}));
+
+static_assert(size(PartialOutputSmemLayout{}) ==
+                  kPartialStoreRows * kTileN,
+              "The swizzled partial-output layout must cover one store slab");
 
 template <typename GemmConfig, typename TmaPartialOutput>
 __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
@@ -50,13 +59,16 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
   constexpr int kConfigTileK = GemmConfig::kTileK;
   constexpr int kConfigStages = GemmConfig::kStage;
   constexpr int kMathThreads = size(TiledMma{});
-  using PartialOutputSmemLayout = Layout<
-      Shape<Int<kPartialStoreRows>, Int<kConfigTileN>>,
-      Stride<Int<kConfigTileN>, _1>>;
+  constexpr int kPartialStoreCount =
+      kConfigTileM / kPartialStoreRows;
   constexpr int kPartialOutputSmemOffset =
       (sizeof(TensorStorage) + 127) / 128 * 128;
   static_assert(kMathThreads == 256,
                 "SM120 cooperative NVFP4 MMA requires 256 math threads");
+  static_assert(kPartialOutputSmemOffset % 1024 == 0,
+                "The SW128 staging buffer must be 1024-byte aligned");
+  static_assert(kConfigTileN == kTileN,
+                "The partial-output shared layout is specialized for tile N=128");
   static_assert(kConfigTileM % kPartialStoreRows == 0,
                 "The partial-output tile must split evenly into TMA stores");
 
@@ -229,18 +241,40 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
         make_shape(Int<kConfigTileM>{}, Int<kConfigTileN>{}),
         make_stride(Int<kConfigTileN>{}, _1{}));
     auto accum = thread_mma.partition_fragment_C(output_tile);
-    auto identity = make_identity_tensor(shape(output_tile));
-    auto output_coordinates = thread_mma.partition_C(identity);
 
     auto partial_output_tma_slice = tma_partial_output.get_slice(0);
     auto partial_output_coordinates = tma_partial_output.get_tma_tensor(
         make_shape(m, n, groups * split_k));
-    auto shared_partial_output = make_tensor(
-        make_smem_ptr(reinterpret_cast<float*>(
-            shared_memory + kPartialOutputSmemOffset)),
-        PartialOutputSmemLayout{});
+    auto shared_partial_output = as_position_independent_swizzle_tensor(
+        make_tensor(
+            make_smem_ptr(reinterpret_cast<float*>(
+                shared_memory + kPartialOutputSmemOffset)),
+            PartialOutputSmemLayout{}));
     auto tma_shared_partial_output =
         partial_output_tma_slice.partition_S(shared_partial_output);
+
+    // Follow the CUTLASS SM120 epilogue's accumulator-to-shared tiling.  The
+    // STSM atom is used only as the reference thread/value layout; FP32 data
+    // is stored by the auto-vectorizing copy selected for FP32 accumulators.
+    using ReferenceCopyAtom =
+        Copy_Atom<SM90_U32x2_STSM_N, cutlass::half_t>;
+    auto tiled_copy_c_atom =
+        make_tiled_copy_C_atom(ReferenceCopyAtom{}, tiled_mma);
+    auto tiled_r2s = make_tiled_copy_S(
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, float>{},
+        tiled_copy_c_atom);
+    auto thread_r2s = tiled_r2s.get_thread_slice(thread_idx);
+    auto tRS_rAcc = thread_r2s.retile_S(accum);
+    auto tRS_sPartialOutput =
+        thread_r2s.partition_D(shared_partial_output);
+    static_assert(decltype(size<1>(tRS_rAcc))::value ==
+                      kPartialStoreCount,
+                  "The R2S accumulator partition must expose one mode per slab");
+    static_assert(
+        decltype(max_common_vector(
+            layout(tRS_rAcc(_, _0{}, _)),
+            layout(tRS_sPartialOutput)))::value >= 2,
+        "The FP32 partial-output store must retain at least 64-bit vectors");
 
     int read_stage = 0;
     int read_phase = 0;
@@ -295,22 +329,10 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
         }
       }
 
-      constexpr int kPartialStoreCount =
-          kConfigTileM / kPartialStoreRows;
       // A full FP32 128x128 tile would require 64 KiB of staging storage.
       // Stage two 64-row slabs through the same 32 KiB buffer instead.
-#pragma unroll
-      for (int store = 0; store < kPartialStoreCount; ++store) {
-#pragma unroll
-        for (int i = 0; i < size(accum); ++i) {
-          auto coordinate = output_coordinates(i);
-          const int local_row = get<0>(coordinate);
-          if (local_row / kPartialStoreRows == store) {
-            shared_partial_output(
-                local_row - store * kPartialStoreRows,
-                get<1>(coordinate)) = static_cast<float>(accum(i));
-          }
-        }
+      for_each(make_int_sequence<kPartialStoreCount>{}, [&](auto store) {
+        copy(tiled_r2s, tRS_rAcc(_, store, _), tRS_sPartialOutput);
 
         cutlass::arch::fence_view_async_shared();
         cutlass::arch::NamedBarrier::sync(
@@ -335,7 +357,7 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
         cutlass::arch::NamedBarrier::sync(
             kMathThreads,
             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-      }
+      });
     }
   }
 }
@@ -438,10 +460,6 @@ GemmStatus launch(
   auto tma = config.get_tma(input, weight, input_scale, weight_scale);
   // Flatten (split, group) into one batch coordinate while preserving the
   // workspace layout [split][group][m][n].
-  using PartialOutputSmemLayout = cute::Layout<
-      cute::Shape<cute::Int<kPartialStoreRows>,
-                  cute::Int<Config::kTileN>>,
-      cute::Stride<cute::Int<Config::kTileN>, cute::_1>>;
   auto partial_output = cute::make_tensor(
       cute::make_gmem_ptr(static_cast<float*>(workspace)),
       cute::make_shape(
