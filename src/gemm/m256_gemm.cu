@@ -70,6 +70,8 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
       (sizeof(TensorStorage) + 127) / 128 * 128;
   static_assert(kMathThreads == 256,
                 "SM120 cooperative NVFP4 MMA requires 256 math threads");
+  static_assert(kSpecializedM == 2 * kConfigTileM,
+                "The M=256 task mapping requires exactly two M tiles");
   static_assert(kPartialOutputSmemOffset % 1024 == 0,
                 "The SW128 staging buffer must be 1024-byte aligned");
   static_assert(kConfigTileN == kTileN,
@@ -149,8 +151,8 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
         const int split = flat_task % split_k;
         constexpr int group = 0;
         const int local_tile = flat_tile;
-        const int tile_m = local_tile / tile_count_n;
-        const int tile_n = local_tile % tile_count_n;
+        const int tile_m = static_cast<int>(local_tile >= tile_count_n);
+        const int tile_n = local_tile - tile_m * tile_count_n;
         const int tile_k_begin = tile_count_k * split / split_k;
         const int tile_k_end = tile_count_k * (split + 1) / split_k;
 
@@ -290,8 +292,8 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
       const int split = flat_task % split_k;
       constexpr int group = 0;
       const int local_tile = flat_tile;
-      const int tile_m = local_tile / tile_count_n;
-      const int tile_n = local_tile % tile_count_n;
+      const int tile_m = static_cast<int>(local_tile >= tile_count_n);
+      const int tile_n = local_tile - tile_m * tile_count_n;
       const int tile_k_begin = tile_count_k * split / split_k;
       const int tile_k_end = tile_count_k * (split + 1) / split_k;
       clear(accum);
