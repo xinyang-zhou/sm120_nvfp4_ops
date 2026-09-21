@@ -364,18 +364,26 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
   }
 }
 
-// The M=256 path is fixed to split_k=2.  Spell out both loads so the
-// compiler can issue them independently before their dependent FP32 add.
-__global__ void reduce_m256_split2_kernel(
+// The M=256 path is fixed to split_k=2.  Process two adjacent outputs per
+// thread so the two partial loads and the FP16 output store stay vectorized.
+// Launch-time pointer checks plus the even split stride guarantee float2/half2
+// alignment for both split-major workspace slices.
+__global__ void reduce_m256_split2_half2_kernel(
     const float* partial_output, half* output,
     int64_t output_elements) {
-  for (int64_t index =
+  const auto* partial_pairs =
+      reinterpret_cast<const float2*>(partial_output);
+  auto* output_pairs = reinterpret_cast<half2*>(output);
+  const int64_t pair_elements = output_elements / 2;
+  for (int64_t pair =
            static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < output_elements;
-       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    const float partial_0 = partial_output[index];
-    const float partial_1 = partial_output[output_elements + index];
-    output[index] = __float2half_rn(partial_0 + partial_1);
+       pair < pair_elements;
+       pair += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const float2 partial_0 = partial_pairs[pair];
+    const float2 partial_1 = partial_pairs[pair_elements + pair];
+    output_pairs[pair] = __floats2half2_rn(
+        partial_0.x + partial_1.x,
+        partial_0.y + partial_1.y);
   }
 }
 
@@ -424,7 +432,8 @@ GemmStatus launch(
   if (required_workspace == 0 || a == nullptr || b == nullptr ||
       sfa == nullptr || sfb == nullptr || output == nullptr ||
       workspace == nullptr ||
-      (reinterpret_cast<std::uintptr_t>(workspace) % alignof(float)) != 0) {
+      (reinterpret_cast<std::uintptr_t>(workspace) % alignof(float2)) != 0 ||
+      (reinterpret_cast<std::uintptr_t>(output) % alignof(half2)) != 0) {
     return GemmStatus::kInvalidArgument;
   }
   if (workspace_bytes < required_workspace) {
@@ -501,12 +510,13 @@ GemmStatus launch(
 
   const int64_t output_elements =
       static_cast<int64_t>(groups) * m * n;
+  const int64_t output_pairs = output_elements / 2;
   const int64_t required_reduction_blocks =
-      (output_elements + kReductionThreads - 1) / kReductionThreads;
+      (output_pairs + kReductionThreads - 1) / kReductionThreads;
   const int reduction_blocks = static_cast<int>(std::min<int64_t>(
       required_reduction_blocks,
       static_cast<int64_t>(properties.multiProcessorCount) * 4));
-  reduce_m256_split2_kernel<<<
+  reduce_m256_split2_half2_kernel<<<
       reduction_blocks, kReductionThreads, 0, stream>>>(
       static_cast<const float*>(workspace), output, output_elements);
   return cudaPeekAtLastError() == cudaSuccess
