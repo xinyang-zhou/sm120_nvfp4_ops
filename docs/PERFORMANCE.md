@@ -71,6 +71,42 @@ made M=16 about 2% slower and M=32 about 1.6% slower. At M=64, TMA measured
 crossover. This threshold is specific to the fixed 128x128 tile and should be
 revisited together with future shape autotuning.
 
+## Default fixed-M dispatcher
+
+The public default `nvfp4_gemm_sm120`/Python `gemm` entry points now select
+two repository-owned fixed-M implementations. The explicit
+`nvfp4_cute_gemm_sm120`/Python `cute_gemm` entry points remain the generic
+baseline.
+
+RTX 5090 CUDA Event results for `N=4096, K=8192`, 500 warmups and 500 timed
+iterations:
+
+| M | Selected path | Workspace | Generic CuTe | Dispatched total | Throughput | Speedup | Validation |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 128 | Split-K=4 | 8 MiB | 26.211 us | 13.027 us | 659.41 TFLOP/s | 2.012x | 0 mismatches |
+| 256 | Split-K=2 | 8 MiB | 26.325 us | 18.103 us | 949.03 TFLOP/s | 1.454x | 0 mismatches |
+
+The M=128 result was stable at approximately 13.02 us in four of five repeated
+runs; one cold/outlier run measured 15.35 us. Three final M=256 runs measured
+18.103--18.106 us. All reported comparisons validated every output element
+against the generic path with zero absolute and relative error.
+
+Nsight Systems separated the final M=256 implementation into a 15.739 us
+partial GEMM and a 2.188 us reduction. The checked-in benchmark measures the
+complete two-kernel path and prints the selected dispatcher path:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./build/benchmark_gemm_specialized \
+  128 4096 8192 500 500
+CUDA_VISIBLE_DEVICES=0 ./build/benchmark_gemm_specialized \
+  256 4096 8192 500 500
+```
+
+These measurements were collected interactively during specialization work;
+the profiler reports are intentionally not part of the source tree. They
+should be rerun into a structured artifact before being cited as fully
+traceable external evidence.
+
 ## Historical CUTLASS-only sweep
 
 Before Custom CuTe was added, `nvfp4_gemm_sm120` referred to the CUTLASS Collective implementation. The earlier sweep below is retained for experiment history, but it must not be presented as Custom CuTe performance.

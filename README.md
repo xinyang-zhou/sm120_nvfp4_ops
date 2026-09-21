@@ -14,11 +14,12 @@ Custom CuTe NVFP4 GEMM
 
 输入使用 packed E2M1，scale 使用 UE4M3，累加为 FP32，输出为 FP16。
 
-> 项目目前处于 research preview 阶段：核心 kernel 和正确性测试已在 RTX 5090 上运行，workspace 管理、epilogue 和 shape autotuning 仍会继续演进。
+> 项目目前处于 research preview 阶段：核心 kernel 和正确性测试已在 RTX 5090 上运行；单 GEMM 的通用、M=128 与 M=256 路径已经收尾，后续工作集中在 attention/MoE 集成。
 
 ## Highlights
 
 - 仓库自有 Custom CuTe 单 GEMM，不调用 CUTLASS `GemmUniversal` 或 `GemmUniversalAdapter`；
+- 默认单 GEMM 按 M 自动分发：M=128 使用 Split-K=4、M=256 使用 Split-K=2，其他 M 使用通用 CuTe；
 - 显式实现 384-thread producer/consumer warp specialization、三阶段 TMA pipeline 和 persistent CTA tile scheduling；
 - FP16 epilogue 对不少于 64 行的问题使用 shared-memory staging 与 TMA store，小 M 保留低开销 predicated store；
 - 使用 `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X` 原生 block-scaled Tensor Core 指令；
@@ -43,7 +44,9 @@ sm120_nvfp4_ops/
 ├── src/
 │   ├── common/                # 单/Grouped GEMM 共用的 CuTe 配置
 │   ├── gemm/
-│   │   ├── cute_gemm.cu       # 仓库自有 Custom CuTe kernel
+│   │   ├── cute_gemm.cu       # 通用 Custom CuTe kernel
+│   │   ├── gemm_dispatch.cu    # 默认 M-shape 路径选择
+│   │   ├── specialized/        # M=128 / M=256 固定 Split-K 路径
 │   │   └── cutlass_reference.cu
 │   ├── grouped_gemm/          # persistent expert GEMM
 │   ├── attention/             # dense prefill/decode QK/softmax/PV
@@ -58,10 +61,11 @@ sm120_nvfp4_ops/
 
 本目录是项目唯一源码树；早期原型目录不属于当前仓库，也不参与构建、测试或性能数据生成。
 
-实现边界：`src/gemm/cute_gemm.cu` 和 `src/grouped_gemm/` 中的执行
-kernel 与调度逻辑由本仓库实现；CuTe/CUTLASS 提供 MMA atom、Tensor、TMA
-layout/copy 等底层 primitive；`src/gemm/cutlass_reference.cu` 只用于 reference，
-cuBLASLt 只用于 benchmark baseline，不属于默认执行路径。
+实现边界：`src/gemm/cute_gemm.cu`、`src/gemm/specialized/` 和
+`src/grouped_gemm/` 中的执行 kernel 与调度逻辑由本仓库实现；CuTe/CUTLASS
+提供 MMA atom、Tensor、TMA layout/copy 等底层 primitive；
+`src/gemm/cutlass_reference.cu` 只用于 reference，cuBLASLt 只用于 benchmark
+baseline，不属于默认执行路径。
 
 ## Requirements
 
@@ -144,8 +148,9 @@ export PYTHONPATH="$PWD/build/python:$PYTHONPATH"
 ```python
 import sm120_nvfp4
 
-# 默认路径就是 Custom CuTe。
+# 默认路径在 M=128/M=256 使用专用 kernel，其余 M 回退通用 CuTe。
 y = sm120_nvfp4.gemm(a, weight, a_scale, weight_scale)
+# 显式通用基线，不经过 M-shape dispatcher。
 y_cute = sm120_nvfp4.cute_gemm(a, weight, a_scale, weight_scale)
 
 # 仅用于对照。
@@ -252,6 +257,13 @@ E2M1 数据与 UE4M3 scale，并逐元素验证。
 [Performance](docs/PERFORMANCE.md)。在新的结构化结果重新采集并入库前，
 这些历史手工记录数字不应直接作为简历中的可追溯结果。
 
+默认 dispatcher 在相同目标 shape 上相对显式通用 CuTe 的最终结果：
+
+| M,N,K | Selected path | Generic CuTe | Dispatched | Speedup | Validation |
+|---|---|---:|---:|---:|---:|
+| 128,4096,8192 | M128 Split-K=4 | 26.21 us | 13.03 us | 2.01x | 0 mismatches |
+| 256,4096,8192 | M256 Split-K=2 | 26.33 us | 18.10 us | 1.45x | 0 mismatches |
+
 单 token decode attention（`Hq=32`、`Hkv=8`、`N=1024`、
 `D=Dv=128`，30 次 warmup、300 次 CUDA Event 计时）：
 
@@ -287,6 +299,7 @@ NVLink/RDMA Kernel 性能；详细定义和原始数据见
 - decode 支持 GQA/MQA、动态有效长度、paged KV cache 和 split-K/LSE combine；尚未支持 MTP 或动态 device task map；
 - prefill 当前仍会 materialize FP32 logits 和 NVFP4 probability workspace；两种 decode 路径均融合 QK、在线 softmax 与 PV，不落地完整 logits/probability；
 - Custom CuTe 当前只有 `128 x 128 x 128`、3-stage 配置；
+- 默认 GEMM 已完成 M=128/M=256 专用路径和其他 M 的通用回退；两条专用路径需要由 workspace query 返回的 FP32 临时空间；
 - Custom CuTe 的 FP32-output 路径及 `M < 64` 的 FP16 路径仍使用线程直接写回；其余 FP16 tile 使用 TMA store；
 - Grouped GEMM 要求所有 group 共享 N/K，M 由 `seqlens` 给出；
 - scale 必须预先转换为 SM1xx 物理布局；
@@ -294,12 +307,15 @@ NVLink/RDMA Kernel 性能；详细定义和原始数据见
 - 当前双 GPU 基准使用参考通信验证接口，不包含 DeepEP 原生 NVLink/RDMA Kernel；
 - cuBLASLt 当前对测试的 NVFP4 pointer-array grouped 配置没有可用原生算法。
 
-下一步重点：
+GEMM 阶段收尾状态：
 
-- [ ] 为 `M=16/32/64` 与中大 M 分别增加 tile/stage specialization；
-- [ ] 为 `M < 64` 评估 vectorized direct/shared-memory store；`M >= 64`
-  的 FP16 TMA-store 路径已经完成，不重复列为 TODO；
-- [ ] 增加 host-side shape dispatch 与离线 autotuning；
+- [x] M=128 Split-K=4 专用路径、正确性与稳定性能验证；
+- [x] M=256 Split-K=2 专用路径、`half2` reduction 与固定 task mapping；
+- [x] 默认 host-side shape dispatch、workspace contract 与通用回退；
+- [x] 显式通用 CuTe/CUTLASS reference 接口保持独立。
+
+项目后续重点：
+
 - [x] 为 Expert-major 路径增加调用方 Workspace 和 MoE 元数据复用；
 - [x] 增加 Grouped GEMM 与双 GPU Fused MoE 对接的可复现 benchmark；
 - [x] 增加 dense/paged decode attention 的可复现 benchmark；

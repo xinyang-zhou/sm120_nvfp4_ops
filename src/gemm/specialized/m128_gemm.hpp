@@ -7,10 +7,11 @@
 
 #include "sm120_nvfp4/gemm.hpp"
 
-namespace sm120_nvfp4::splitk_experiment {
+namespace sm120_nvfp4::gemm_specialized::m128 {
 
-// Experimental SM120 Split-K path. It intentionally lives outside the public
-// API and is not selected by the default GEMM dispatcher.
+// M=128 Split-K specialization selected by the default GEMM dispatcher.
+// This remains an internal implementation detail rather than a public backend.
+// It supports groups=1 and split_k=4; other values are rejected internally.
 //
 // Workspace layout is split-major FP32:
 //   [split_k, groups, m, n]
@@ -27,4 +28,4 @@ GemmStatus launch(
     void* workspace, std::size_t workspace_bytes,
     cudaStream_t stream = nullptr);
 
-}  // namespace sm120_nvfp4::splitk_experiment
+}  // namespace sm120_nvfp4::gemm_specialized::m128

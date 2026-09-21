@@ -30,7 +30,7 @@ C      [M, N] half
 
 Constraints: `M > 0`, `K % 32 == 0`, `N % 8 == 0`.
 
-### C++ Custom CuTe
+### C++ generic Custom CuTe
 
 The explicit Custom CuTe entry point needs no global workspace:
 
@@ -43,16 +43,34 @@ auto status = sm120_nvfp4::nvfp4_cute_gemm_sm120(
     sfa, sfb, output_fp16, stream);
 ```
 
-The compatibility/default entry point also dispatches to Custom CuTe. Its workspace query returns zero:
+The default entry point is a shape dispatcher:
+
+| M | Selected path | Split-K | Workspace |
+|---:|---|---:|---:|
+| 128 | M=128 specialization | 4 | `4*M*N*sizeof(float)` |
+| 256 | M=256 specialization | 2 | `2*M*N*sizeof(float)` |
+| other | generic Custom CuTe | 1 | 0 |
+
+The specialization is selected only when its N/K alignment and K-partition
+constraints are satisfied; otherwise the dispatcher safely falls back to the
+generic path. Query and allocate the exact workspace before launch:
 
 ```cpp
 std::size_t bytes =
     sm120_nvfp4::nvfp4_gemm_workspace_size_sm120(m, n, k);
+void* workspace = nullptr;
+if (bytes != 0) {
+  cudaMalloc(&workspace, bytes);
+}
 
 auto status = sm120_nvfp4::nvfp4_gemm_sm120(
     m, n, k, a_packed, b_transposed_packed,
-    sfa, sfb, output_fp16, nullptr, bytes, stream);
+    sfa, sfb, output_fp16, workspace, bytes, stream);
 ```
+
+`nvfp4_gemm_path_sm120(m,n,k)` exposes the deterministic selection for
+diagnostics. `nvfp4_cute_gemm_sm120` remains the explicit zero-workspace
+generic entry point.
 
 ### C++ CUTLASS reference
 
@@ -71,8 +89,10 @@ auto status = sm120_nvfp4::nvfp4_cutlass_gemm_sm120(
 ### Python
 
 ```python
-# Default and explicit Custom CuTe paths are equivalent.
+# Default path automatically specializes M=128/M=256.
 y = sm120_nvfp4.gemm(a, b, sfa, sfb)
+
+# Explicit generic path, useful as a stable baseline.
 y_cute = sm120_nvfp4.cute_gemm(a, b, sfa, sfb)
 
 # Reference-only path.

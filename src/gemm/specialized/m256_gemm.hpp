@@ -7,11 +7,10 @@
 
 #include "sm120_nvfp4/gemm.hpp"
 
-namespace sm120_nvfp4::m256_experiment {
+namespace sm120_nvfp4::gemm_specialized::m256 {
 
-// Specialized experimental path for groups=1, M=256, and split_k=2.  It
-// intentionally lives outside the public API and is not selected by the
-// default GEMM dispatcher.  Other groups, M, or split_k values are rejected.
+// M=256 Split-K specialization selected by the default GEMM dispatcher.
+// It supports groups=1 and split_k=2; other values are rejected internally.
 //
 // Workspace layout is split-major FP32:
 //   [split_k, groups, m, n]
@@ -28,4 +27,4 @@ GemmStatus launch(
     void* workspace, std::size_t workspace_bytes,
     cudaStream_t stream = nullptr);
 
-}  // namespace sm120_nvfp4::m256_experiment
+}  // namespace sm120_nvfp4::gemm_specialized::m256

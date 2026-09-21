@@ -12,7 +12,7 @@
 
 namespace {
 
-enum class GemmBackend { kCute, kCutlass };
+enum class GemmBackend { kAuto, kCute, kCutlass };
 
 void check_packed_cuda_tensor(
     const torch::Tensor& tensor, const char* name) {
@@ -88,7 +88,18 @@ torch::Tensor fp4_gemm_torch(
       at::cuda::getCurrentCUDAStream(a.device().index()).stream();
   sm120_nvfp4::GemmStatus status;
 
-  if (backend == GemmBackend::kCute) {
+  if (backend == GemmBackend::kAuto) {
+    std::size_t workspace_bytes =
+        sm120_nvfp4::nvfp4_gemm_workspace_size_sm120(m, n, k);
+    auto workspace = torch::empty(
+        {static_cast<int64_t>(workspace_bytes)},
+        a.options().dtype(torch::kUInt8));
+    status = sm120_nvfp4::nvfp4_gemm_sm120(
+        m, n, k, a.data_ptr(), b.data_ptr(), sfa.data_ptr(), sfb.data_ptr(),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        workspace_bytes == 0 ? nullptr : workspace.data_ptr(),
+        workspace_bytes, stream);
+  } else if (backend == GemmBackend::kCute) {
     status = sm120_nvfp4::nvfp4_cute_gemm_sm120(
         m, n, k, a.data_ptr(), b.data_ptr(), sfa.data_ptr(), sfb.data_ptr(),
         reinterpret_cast<half*>(output.data_ptr<at::Half>()), stream);
@@ -107,11 +118,22 @@ torch::Tensor fp4_gemm_torch(
 
   TORCH_CHECK(
       status == sm120_nvfp4::GemmStatus::kSuccess,
-      backend == GemmBackend::kCute ? "Custom CuTe GEMM failed: "
-                                    : "CUTLASS reference GEMM failed: ",
+      backend == GemmBackend::kAuto
+          ? "Default GEMM failed: "
+          : (backend == GemmBackend::kCute
+                 ? "Custom CuTe GEMM failed: "
+                 : "CUTLASS reference GEMM failed: "),
       sm120_nvfp4::gemm_status_string(status));
   C10_CUDA_CHECK(cudaGetLastError());
   return output;
+}
+
+torch::Tensor gemm_torch(
+    torch::Tensor a, torch::Tensor b,
+    torch::Tensor sfa, torch::Tensor sfb) {
+  return fp4_gemm_torch(
+      std::move(a), std::move(b), std::move(sfa), std::move(sfb),
+      GemmBackend::kAuto);
 }
 
 torch::Tensor cute_gemm_torch(
@@ -136,7 +158,7 @@ TORCH_LIBRARY_FRAGMENT(sm120_nvfp4, m) {
   m.def("gemm(Tensor a, Tensor b, Tensor sfa, Tensor sfb) -> Tensor");
   m.def("cute_gemm(Tensor a, Tensor b, Tensor sfa, Tensor sfb) -> Tensor");
   m.def("cutlass_gemm(Tensor a, Tensor b, Tensor sfa, Tensor sfb) -> Tensor");
-  m.impl("gemm", torch::kCUDA, &cute_gemm_torch);
+  m.impl("gemm", torch::kCUDA, &gemm_torch);
   m.impl("cute_gemm", torch::kCUDA, &cute_gemm_torch);
   m.impl("cutlass_gemm", torch::kCUDA, &cutlass_gemm_torch);
 }

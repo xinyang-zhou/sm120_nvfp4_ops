@@ -65,6 +65,21 @@ enum class GemmStatus : int {
 
 const char* gemm_status_string(GemmStatus status);
 
+// Runtime path selected by the default single-GEMM entry point. The explicit
+// nvfp4_cute_gemm_sm120 entry point always uses kGenericCute.
+enum class Nvfp4GemmPath : int {
+  kGenericCute = 0,
+  kM128SplitK4,
+  kM256SplitK2,
+};
+
+const char* nvfp4_gemm_path_string(Nvfp4GemmPath path);
+
+// This selector is deterministic and does not inspect the current device.
+// Unsupported or invalid specialized shapes select the generic CuTe path;
+// the launch entry point remains responsible for argument validation.
+Nvfp4GemmPath nvfp4_gemm_path_sm120(int m, int n, int k);
+
 // Custom CuTe implementation. This launches a repository-owned __global__ kernel,
 // uses a persistent CTA schedule, and executes the SM120 block-scaled MMA via
 // cute::gemm. It does not use CUTLASS GemmUniversal or its device adapter.
@@ -109,12 +124,15 @@ GemmStatus nvfp4_cutlass_gemm_sm120(
     void* workspace, std::size_t workspace_bytes,
     cudaStream_t stream = nullptr);
 
-// Workspace size for the default custom CuTe implementation. A return value of
-// zero is valid. Invalid dimensions also return zero and are rejected by the
-// launch function.
+// Workspace size for the automatically selected default path. M=128 and
+// M=256 specializations use an FP32 Split-K workspace; the generic CuTe path
+// uses no workspace. Invalid dimensions also return zero and are rejected by
+// the launch function.
 std::size_t nvfp4_gemm_workspace_size_sm120(int m, int n, int k);
 
-// Default custom CuTe NVFP4 GEMM on SM120:
+// Default NVFP4 GEMM dispatcher on SM120. It selects the measured M=128 and
+// M=256 specializations when their shape constraints are met, and otherwise
+// falls back to nvfp4_cute_gemm_sm120:
 //
 //   C[M,N] = (A_payload * SFA) @ (B_payload * SFB)^T
 //

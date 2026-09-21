@@ -83,6 +83,39 @@ float make_b_value(int n, int k) {
 
 int main() {
   using sm120_nvfp4::GemmStatus;
+  using sm120_nvfp4::Nvfp4GemmPath;
+
+  struct PathCase {
+    int m;
+    int n;
+    int k;
+    Nvfp4GemmPath expected_path;
+    std::size_t expected_workspace;
+  };
+  constexpr PathCase kPathCases[] = {
+      {16, 4096, 8192, Nvfp4GemmPath::kGenericCute, 0},
+      {128, 4096, 8192, Nvfp4GemmPath::kM128SplitK4,
+       static_cast<std::size_t>(4) * 128 * 4096 * sizeof(float)},
+      {256, 4096, 8192, Nvfp4GemmPath::kM256SplitK2,
+       static_cast<std::size_t>(2) * 256 * 4096 * sizeof(float)},
+      // Four K partitions cannot be formed from one 128-wide K tile.
+      {128, 128, 128, Nvfp4GemmPath::kGenericCute, 0},
+  };
+  for (const PathCase& path_case : kPathCases) {
+    const auto path = sm120_nvfp4::nvfp4_gemm_path_sm120(
+        path_case.m, path_case.n, path_case.k);
+    const std::size_t workspace =
+        sm120_nvfp4::nvfp4_gemm_workspace_size_sm120(
+            path_case.m, path_case.n, path_case.k);
+    if (path != path_case.expected_path ||
+        workspace != path_case.expected_workspace) {
+      std::cerr << "Unexpected dispatcher result for M=" << path_case.m
+                << ", N=" << path_case.n << ", K=" << path_case.k
+                << ": path=" << sm120_nvfp4::nvfp4_gemm_path_string(path)
+                << ", workspace=" << workspace << '\n';
+      return 4;
+    }
+  }
 
   std::cout << "SM120 hardware NVFP4 Tensor Core GEMM test\n"
             << "Problem: A[" << kTestM << ',' << kTestK << "] @ B^T["

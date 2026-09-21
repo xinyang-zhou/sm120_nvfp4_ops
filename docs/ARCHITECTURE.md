@@ -6,9 +6,11 @@ The project is organized as one operator stack rather than three unrelated examp
 
 ```text
 Layer 1: Single GEMM
-  Custom CuTe kernel ───────────────┐
-  CUTLASS Collective reference ─────┼─ correctness/performance comparison
-  cuBLASLt baseline ────────────────┘
+  shape dispatcher ─┬─ M=128 Split-K=4 ─┐
+                    ├─ M=256 Split-K=2 ─┼─ repository-owned kernels
+                    └─ generic CuTe ─────┤
+  CUTLASS Collective reference ──────────┼─ correctness/performance comparison
+  cuBLASLt baseline ─────────────────────┘
                     |
           ┌─────────┴──────────┐
           v                    v
@@ -26,13 +28,16 @@ Layer 3: Fused MoE
 
 ## Custom CuTe GEMM
 
-The default GEMM computes:
+All single-GEMM paths compute:
 
 ```text
 C[M,N] = (A_e2m1[M,K] * SFA) @ (B_e2m1[N,K] * SFB)^T
 ```
 
-[`src/gemm/cute_gemm.cu`](../src/gemm/cute_gemm.cu) owns and launches the CUDA kernel. It does not instantiate `cutlass::gemm::kernel::GemmUniversal` or `cutlass::gemm::device::GemmUniversalAdapter`.
+[`src/gemm/cute_gemm.cu`](../src/gemm/cute_gemm.cu) owns and launches the
+generic CUDA kernel. It does not instantiate
+`cutlass::gemm::kernel::GemmUniversal` or
+`cutlass::gemm::device::GemmUniversalAdapter`.
 
 The current specialization uses:
 
@@ -55,6 +60,23 @@ residue outside M/N. A second named-barrier prevents reuse of the single
 epilogue tile before the store completes. FP32 output, used by prefill logits,
 retains the direct predicated path because a full FP32 staging tile would
 exceed the useful shared-memory budget.
+
+### Shape dispatcher and fixed-M paths
+
+[`src/gemm/gemm_dispatch.cu`](../src/gemm/gemm_dispatch.cu) is the only
+default-path selector. It routes supported `M=128` shapes to Split-K=4,
+supported `M=256` shapes to Split-K=2, and all other shapes to the generic
+kernel. Selection depends only on `(M,N,K)` and can be inspected through
+`nvfp4_gemm_path_sm120`.
+
+The two implementations live under
+[`src/gemm/specialized/`](../src/gemm/specialized). They produce FP32 partial
+matrices in caller-owned workspace and use a second kernel to reduce and
+convert to FP16. The split counts are fixed, not runtime tuning parameters.
+The M=256 path additionally fixes its tile-to-task mapping and uses a
+vectorized `half2` reduction. Attention continues to call the explicit
+generic FP16/FP32 and batched interfaces; it is not redirected through this
+single-GEMM dispatcher.
 
 `cuobjdump` confirms that this repository-owned kernel contains:
 
@@ -218,7 +240,8 @@ Uniform tests can fill the physical allocation with one UE4M3 byte. Non-uniform 
 
 - `include/`: supported C++ entry points and contracts;
 - `src/common/`: shared CuTe configuration and device helpers;
-- `src/gemm/`: Custom CuTe kernel and isolated CUTLASS reference;
+- `src/gemm/`: default dispatcher, generic/specialized Custom CuTe kernels,
+  and isolated CUTLASS reference;
 - `src/grouped_gemm/`: dynamic expert scheduling and compute kernel;
 - `src/attention/`: materialized prefill plus fused streaming/split-K decode;
 - `bindings/`: validation, allocation and PyTorch registration;

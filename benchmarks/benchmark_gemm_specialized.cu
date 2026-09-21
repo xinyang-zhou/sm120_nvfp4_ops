@@ -14,7 +14,6 @@
 #include <string>
 #include <vector>
 
-#include "gemm/m256_gemm.hpp"
 #include "sm120_nvfp4/gemm.hpp"
 
 namespace {
@@ -112,13 +111,13 @@ struct ValidationStats {
 
 ValidationStats compare_outputs(
     const std::vector<half>& baseline,
-    const std::vector<half>& splitk) {
+    const std::vector<half>& dispatched) {
   ValidationStats stats;
   constexpr float kAbsoluteTolerance = 0.5f;
   constexpr float kRelativeTolerance = 1.0e-3f;
   for (std::size_t index = 0; index < baseline.size(); ++index) {
     const float lhs = __half2float(baseline[index]);
-    const float rhs = __half2float(splitk[index]);
+    const float rhs = __half2float(dispatched[index]);
     const float absolute_error = std::fabs(lhs - rhs);
     const float denominator =
         std::max({1.0f, std::fabs(lhs), std::fabs(rhs)});
@@ -150,8 +149,7 @@ void check_status(sm120_nvfp4::GemmStatus status, const char* path) {
 }
 
 int run(
-    int m, int n, int k, int split_k,
-    int warmup, int iterations) {
+    int m, int n, int k, int warmup, int iterations) {
   CUDA_CHECK(cudaSetDevice(0));
   cudaDeviceProp properties{};
   CUDA_CHECK(cudaGetDeviceProperties(&properties, 0));
@@ -164,12 +162,10 @@ int run(
   const std::size_t sfa_bytes = sm120_nvfp4::scale_a_elements(m, n, k);
   const std::size_t sfb_bytes = sm120_nvfp4::scale_b_elements(m, n, k);
   const std::size_t output_elements = static_cast<std::size_t>(m) * n;
-  const std::size_t splitk_workspace_bytes =
-      sm120_nvfp4::m256_experiment::workspace_size(
-          1, m, n, k, split_k);
-  if (splitk_workspace_bytes == 0) {
-    throw std::invalid_argument("this path requires M=256 and split_k=2");
-  }
+  const auto selected_path =
+      sm120_nvfp4::nvfp4_gemm_path_sm120(m, n, k);
+  const std::size_t workspace_bytes =
+      sm120_nvfp4::nvfp4_gemm_workspace_size_sm120(m, n, k);
 
   std::vector<std::uint8_t> host_a(a_bytes);
   std::vector<std::uint8_t> host_b(b_bytes);
@@ -183,8 +179,8 @@ int run(
   DeviceBuffer device_sfa(sfa_bytes);
   DeviceBuffer device_sfb(sfb_bytes);
   DeviceBuffer baseline_output(output_elements * sizeof(half));
-  DeviceBuffer splitk_output(output_elements * sizeof(half));
-  DeviceBuffer splitk_workspace(splitk_workspace_bytes);
+  DeviceBuffer dispatched_output(output_elements * sizeof(half));
+  DeviceBuffer workspace(workspace_bytes);
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreate(&stream));
@@ -211,51 +207,53 @@ int run(
               static_cast<half*>(baseline_output.data()), stream),
           "baseline");
     };
-    auto launch_splitk = [&] {
+    auto launch_dispatched = [&] {
       check_status(
-          sm120_nvfp4::m256_experiment::launch(
-              1, m, n, k, split_k,
+          sm120_nvfp4::nvfp4_gemm_sm120(
+              m, n, k,
               device_a.data(), device_b.data(),
               device_sfa.data(), device_sfb.data(),
-              static_cast<half*>(splitk_output.data()),
-              splitk_workspace.data(), splitk_workspace.size(), stream),
-          "M=256 specialized path");
+              static_cast<half*>(dispatched_output.data()),
+              workspace.data(), workspace.size(), stream),
+          "default dispatched path");
     };
 
     const float baseline_ms = time_launches(
         launch_baseline, stream, warmup, iterations);
-    const float splitk_ms = time_launches(
-        launch_splitk, stream, warmup, iterations);
+    const float dispatched_ms = time_launches(
+        launch_dispatched, stream, warmup, iterations);
 
     launch_baseline();
-    launch_splitk();
+    launch_dispatched();
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<half> host_baseline(output_elements);
-    std::vector<half> host_splitk(output_elements);
+    std::vector<half> host_dispatched(output_elements);
     CUDA_CHECK(cudaMemcpy(
         host_baseline.data(), baseline_output.data(), baseline_output.size(),
         cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(
-        host_splitk.data(), splitk_output.data(), splitk_output.size(),
+        host_dispatched.data(), dispatched_output.data(),
+        dispatched_output.size(),
         cudaMemcpyDeviceToHost));
     const ValidationStats validation =
-        compare_outputs(host_baseline, host_splitk);
+        compare_outputs(host_baseline, host_dispatched);
 
     std::cout << std::fixed << std::setprecision(6)
               << "Device: " << properties.name << '\n'
-              << "Shape: M=" << m << ", N=" << n << ", K=" << k
-              << ", split_k=" << split_k << '\n'
-              << "Workspace: " << splitk_workspace_bytes << " bytes ("
-              << static_cast<double>(splitk_workspace_bytes) / (1 << 20)
+              << "Shape: M=" << m << ", N=" << n << ", K=" << k << '\n'
+              << "Selected path: "
+              << sm120_nvfp4::nvfp4_gemm_path_string(selected_path) << '\n'
+              << "Workspace: " << workspace_bytes << " bytes ("
+              << static_cast<double>(workspace_bytes) / (1 << 20)
               << " MiB)\n"
               << "Validation: mismatches=" << validation.mismatches
               << ", max_abs_error=" << validation.max_absolute_error
               << ", max_rel_error=" << validation.max_relative_error << '\n'
               << "Baseline: " << baseline_ms << " ms, "
               << tflops(m, n, k, baseline_ms) << " TFLOP/s\n"
-              << "M=256 specialized total: " << splitk_ms << " ms, "
-              << tflops(m, n, k, splitk_ms) << " TFLOP/s\n"
-              << "Speedup: " << baseline_ms / splitk_ms << "x\n";
+              << "Dispatched: " << dispatched_ms << " ms, "
+              << tflops(m, n, k, dispatched_ms) << " TFLOP/s\n"
+              << "Speedup: " << baseline_ms / dispatched_ms << "x\n";
 
     CUDA_CHECK(cudaStreamDestroy(stream));
     return validation.mismatches == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -272,23 +270,21 @@ int main(int argc, char** argv) {
     int m = 256;
     int n = 4096;
     int k = 8192;
-    int split_k = 2;
     int warmup = 500;
     int iterations = 500;
-    if (argc != 1 && argc != 7) {
+    if (argc != 1 && argc != 6) {
       std::cerr << "Usage: " << argv[0]
-                << " [M N K SPLIT_K WARMUP ITERATIONS]\n";
+                << " [M N K WARMUP ITERATIONS]\n";
       return EXIT_FAILURE;
     }
-    if (argc == 7) {
+    if (argc == 6) {
       m = parse_positive_int(argv[1], "M");
       n = parse_positive_int(argv[2], "N");
       k = parse_positive_int(argv[3], "K");
-      split_k = parse_positive_int(argv[4], "SPLIT_K");
-      warmup = parse_positive_int(argv[5], "WARMUP");
-      iterations = parse_positive_int(argv[6], "ITERATIONS");
+      warmup = parse_positive_int(argv[4], "WARMUP");
+      iterations = parse_positive_int(argv[5], "ITERATIONS");
     }
-    return run(m, n, k, split_k, warmup, iterations);
+    return run(m, n, k, warmup, iterations);
   } catch (const std::exception& error) {
     std::cerr << "Error: " << error.what() << '\n';
     return EXIT_FAILURE;

@@ -9,6 +9,7 @@ is historical and must not be presented as fully traceable evidence yet.
 | Claim | Documentation | Raw artifact | Reproduction | Status |
 |---|---|---|---|---|
 | Single GEMM, M=16/128/512 | [Performance](../../docs/PERFORMANCE.md#custom-cute-single-gemm) | Not retained by the original run | Commands below | rerun required |
+| Default fixed-M GEMM, M=128/256 | [Performance](../../docs/PERFORMANCE.md#default-fixed-m-dispatcher) | Interactive reports intentionally not retained | Commands below | rerun required |
 | M=512 scalar 35.0 us to TMA 28.4 us | [Performance](../../docs/PERFORMANCE.md#custom-cute-single-gemm) | Not retained; scalar code is commit `4f227c7`, TMA code is commit `51fde90` | Benchmark both revisions under identical conditions | rerun required |
 | Persistent Grouped GEMM, 1--32 groups | [Performance](../../docs/PERFORMANCE.md#grouped-gemm) | Not retained by the original run | Commands below | rerun required |
 | Dense/paged decode matrix | [Performance](../../docs/PERFORMANCE.md#dense-and-paged-decode-attention) | [`attention_decode_rtx5090_2026-09-13.json`](attention_decode_rtx5090_2026-09-13.json) | [Performance command](../../docs/PERFORMANCE.md#dense-and-paged-decode-attention) | verified |
@@ -35,6 +36,15 @@ done
 Do not overwrite the historical table merely because one rerun differs. Keep
 the new raw files, record clocks/power/idle conditions, then update the table
 with the new run date and explain the difference.
+
+To validate the default selector against the explicit generic baseline:
+
+```bash
+for m in 128 256; do
+  CUDA_VISIBLE_DEVICES=0 ./build/benchmark_gemm_specialized \
+    "$m" 4096 8192 500 500
+done
+```
 
 ## Grouped GEMM rerun
 

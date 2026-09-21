@@ -45,6 +45,38 @@ class GemmTest(unittest.TestCase):
         torch.testing.assert_close(default_output, cute_output, rtol=0, atol=0)
         torch.testing.assert_close(cutlass_output, cute_output, rtol=0, atol=0)
 
+    def test_specialized_dispatch_matches_generic_cute(self) -> None:
+        require_sm120()
+        n, k = 128, 512
+        for m in (128, 256):
+            with self.subTest(m=m):
+                a = torch.full(
+                    (m, k // 2), 0x22, dtype=torch.uint8, device="cuda"
+                )
+                b = torch.full(
+                    (n, k // 2), 0x22, dtype=torch.uint8, device="cuda"
+                )
+                sfa = torch.full(
+                    (sm120_nvfp4.scale_a_elements(m, n, k),),
+                    0x38,
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                sfb = torch.full(
+                    (sm120_nvfp4.scale_b_elements(m, n, k),),
+                    0x38,
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+
+                generic_output = sm120_nvfp4.cute_gemm(a, b, sfa, sfb)
+                dispatched_output = sm120_nvfp4.gemm(a, b, sfa, sfb)
+                torch.cuda.synchronize()
+
+                torch.testing.assert_close(
+                    dispatched_output, generic_output, rtol=0, atol=0
+                )
+
     def test_tma_epilogue_partial_tile(self) -> None:
         require_sm120()
         # M=64 selects TMA for a partial tile. M=129 additionally exercises an

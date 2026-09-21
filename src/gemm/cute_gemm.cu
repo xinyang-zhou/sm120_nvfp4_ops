@@ -465,17 +465,4 @@ GemmStatus nvfp4_cute_batched_gemm_f32_sm120(
       groups, m, n, k, a, b, sfa, sfb, c, stream);
 }
 
-std::size_t nvfp4_gemm_workspace_size_sm120(
-    int /*m*/, int /*n*/, int /*k*/) {
-  return 0;
-}
-
-GemmStatus nvfp4_gemm_sm120(
-    int m, int n, int k, const void* a, const void* b,
-    const void* sfa, const void* sfb, half* c,
-    void* /*workspace*/, std::size_t /*workspace_bytes*/,
-    cudaStream_t stream) {
-  return nvfp4_cute_gemm_sm120(m, n, k, a, b, sfa, sfb, c, stream);
-}
-
 }  // namespace sm120_nvfp4

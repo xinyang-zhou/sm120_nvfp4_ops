@@ -16,7 +16,7 @@ def gemm(
     sfa: torch.Tensor,
     sfb: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute ``A[M,K] @ B[N,K].T`` from packed E2M1 operands."""
+    """Compute GEMM with M=128/M=256 specialization and generic fallback."""
     return torch.ops.sm120_nvfp4.gemm(a, b, sfa, sfb)
 
 
@@ -26,7 +26,7 @@ def cute_gemm(
     sfa: torch.Tensor,
     sfb: torch.Tensor,
 ) -> torch.Tensor:
-    """Run the repository-owned persistent CuTe SM120 kernel."""
+    """Run the generic repository-owned persistent CuTe SM120 kernel."""
     return torch.ops.sm120_nvfp4.cute_gemm(a, b, sfa, sfb)
 
 

@@ -47,6 +47,9 @@ set_target_properties(sm120_nvfp4_common PROPERTIES POSITION_INDEPENDENT_CODE ON
 
 add_library(sm120_nvfp4_gemm STATIC
   src/gemm/cute_gemm.cu
+  src/gemm/gemm_dispatch.cu
+  src/gemm/specialized/m128_gemm.cu
+  src/gemm/specialized/m256_gemm.cu
   src/gemm/status.cpp
   src/gemm/cutlass_reference.cu)
 sm120_nvfp4_configure_target(sm120_nvfp4_gemm)
@@ -122,6 +125,12 @@ if(SM120_NVFP4_BUILD_TESTS)
 endif()
 
 if(SM120_NVFP4_BUILD_BENCHMARKS)
+  add_executable(
+    benchmark_gemm_specialized benchmarks/benchmark_gemm_specialized.cu)
+  sm120_nvfp4_configure_target(benchmark_gemm_specialized)
+  target_link_libraries(
+    benchmark_gemm_specialized PRIVATE sm120_nvfp4_gemm)
+
   add_executable(
     benchmark_gemm_vs_cublaslt benchmarks/benchmark_gemm_vs_cublaslt.cu)
   sm120_nvfp4_configure_target(benchmark_gemm_vs_cublaslt)

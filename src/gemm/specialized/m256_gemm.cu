@@ -1,4 +1,4 @@
-#include "gemm/splitk_gemm.hpp"
+#include "gemm/specialized/m256_gemm.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -16,7 +16,7 @@
 #include "cutlass/arch/reg_reconfig.h"
 #include "common/gemm_config.cuh"
 
-namespace sm120_nvfp4::splitk_experiment {
+namespace sm120_nvfp4::gemm_specialized::m256 {
 namespace {
 
 using namespace cute;  // NOLINT
@@ -28,6 +28,8 @@ constexpr int kStages = 3;
 constexpr int kThreads = 384;
 constexpr int kReductionThreads = 256;
 constexpr int kPartialStoreRows = 64;
+constexpr int kSpecializedM = 256;
+constexpr int kSpecializedSplitK = 2;
 
 using Config = detail::Nvfp4GemmConfig<float, kTileM, kTileN, kTileK, kStages>;
 using PartialOutputSmemLayout = decltype(tile_to_shape(
@@ -39,13 +41,13 @@ static_assert(size(PartialOutputSmemLayout{}) ==
               "The swizzled partial-output layout must cover one store slab");
 
 template <typename GemmConfig, typename TmaPartialOutput>
-__global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
+__global__ void __launch_bounds__(kThreads, 1) nvfp4_m256_partial_kernel(
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaX const tma_x,
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaW const tma_w,
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaSFA const tma_sfa,
     CUTLASS_GRID_CONSTANT typename GemmConfig::TmaSFB const tma_sfb,
     CUTLASS_GRID_CONSTANT TmaPartialOutput const tma_partial_output,
-    int groups, int m, int n, int k, int split_k) {
+    int n, int k) {
   using TiledMma = typename GemmConfig::TiledMma;
   using CollectiveMainloop = typename GemmConfig::CollectiveMainloop;
   using TensorStorage = typename GemmConfig::TensorStorage;
@@ -61,10 +63,15 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
   constexpr int kMathThreads = size(TiledMma{});
   constexpr int kPartialStoreCount =
       kConfigTileM / kPartialStoreRows;
+  constexpr int groups = 1;
+  constexpr int m = kSpecializedM;
+  constexpr int split_k = kSpecializedSplitK;
   constexpr int kPartialOutputSmemOffset =
       (sizeof(TensorStorage) + 127) / 128 * 128;
   static_assert(kMathThreads == 256,
                 "SM120 cooperative NVFP4 MMA requires 256 math threads");
+  static_assert(kSpecializedM == 2 * kConfigTileM,
+                "The M=256 task mapping requires exactly two M tiles");
   static_assert(kPartialOutputSmemOffset % 1024 == 0,
                 "The SW128 staging buffer must be 1024-byte aligned");
   static_assert(kConfigTileN == kTileN,
@@ -142,10 +149,10 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
            flat_task += gridDim.x) {
         const int flat_tile = flat_task / split_k;
         const int split = flat_task % split_k;
-        const int group = flat_tile / tiles_per_group;
-        const int local_tile = flat_tile % tiles_per_group;
-        const int tile_m = local_tile / tile_count_n;
-        const int tile_n = local_tile % tile_count_n;
+        constexpr int group = 0;
+        const int local_tile = flat_tile;
+        const int tile_m = static_cast<int>(local_tile >= tile_count_n);
+        const int tile_n = local_tile - tile_m * tile_count_n;
         const int tile_k_begin = tile_count_k * split / split_k;
         const int tile_k_end = tile_count_k * (split + 1) / split_k;
 
@@ -283,10 +290,10 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
          flat_task += gridDim.x) {
       const int flat_tile = flat_task / split_k;
       const int split = flat_task % split_k;
-      const int group = flat_tile / tiles_per_group;
-      const int local_tile = flat_tile % tiles_per_group;
-      const int tile_m = local_tile / tile_count_n;
-      const int tile_n = local_tile % tile_count_n;
+      constexpr int group = 0;
+      const int local_tile = flat_tile;
+      const int tile_m = static_cast<int>(local_tile >= tile_count_n);
+      const int tile_n = local_tile - tile_m * tile_count_n;
       const int tile_k_begin = tile_count_k * split / split_k;
       const int tile_k_end = tile_count_k * (split + 1) / split_k;
       clear(accum);
@@ -362,25 +369,32 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
   }
 }
 
-__global__ void reduce_splitk_kernel(
+// The M=256 path is fixed to split_k=2.  Process two adjacent outputs per
+// thread so the two partial loads and the FP16 output store stay vectorized.
+// Launch-time pointer checks plus the even split stride guarantee float2/half2
+// alignment for both split-major workspace slices.
+__global__ void reduce_m256_split2_half2_kernel(
     const float* partial_output, half* output,
-    int64_t output_elements, int split_k) {
-  for (int64_t index =
+    int64_t output_elements) {
+  const auto* partial_pairs =
+      reinterpret_cast<const float2*>(partial_output);
+  auto* output_pairs = reinterpret_cast<half2*>(output);
+  const int64_t pair_elements = output_elements / 2;
+  for (int64_t pair =
            static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < output_elements;
-       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    float sum = 0.0f;
-#pragma unroll 1
-    for (int split = 0; split < split_k; ++split) {
-      sum += partial_output[static_cast<int64_t>(split) * output_elements +
-                            index];
-    }
-    output[index] = __float2half_rn(sum);
+       pair < pair_elements;
+       pair += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const float2 partial_0 = partial_pairs[pair];
+    const float2 partial_1 = partial_pairs[pair_elements + pair];
+    output_pairs[pair] = __floats2half2_rn(
+        partial_0.x + partial_1.x,
+        partial_0.y + partial_1.y);
   }
 }
 
 bool valid_shape(int groups, int m, int n, int k, int split_k) {
-  if (groups <= 0 || m <= 0 || n <= 0 || k <= 0 || split_k <= 1 ||
+  if (groups != 1 || m != kSpecializedM || n <= 0 || k <= 0 ||
+      split_k != kSpecializedSplitK ||
       (k % kInputAlignmentElements) != 0 ||
       (n % kOutputAlignmentElements) != 0) {
     return false;
@@ -423,7 +437,8 @@ GemmStatus launch(
   if (required_workspace == 0 || a == nullptr || b == nullptr ||
       sfa == nullptr || sfb == nullptr || output == nullptr ||
       workspace == nullptr ||
-      (reinterpret_cast<std::uintptr_t>(workspace) % alignof(float)) != 0) {
+      (reinterpret_cast<std::uintptr_t>(workspace) % alignof(float2)) != 0 ||
+      (reinterpret_cast<std::uintptr_t>(output) % alignof(half2)) != 0) {
     return GemmStatus::kInvalidArgument;
   }
   if (workspace_bytes < required_workspace) {
@@ -479,7 +494,7 @@ GemmStatus launch(
   const int task_count = tile_count * split_k;
   const int grid_size = std::min(properties.multiProcessorCount, task_count);
   auto partial_kernel =
-      nvfp4_splitk_partial_kernel<Config, decltype(tma_partial_output)>;
+      nvfp4_m256_partial_kernel<Config, decltype(tma_partial_output)>;
   constexpr int kPartialOutputSmemOffset =
       (Config::get_shm_size() + 127) / 128 * 128;
   constexpr int kSharedMemoryBytes =
@@ -493,25 +508,25 @@ GemmStatus launch(
 
   partial_kernel<<<grid_size, kThreads, kSharedMemoryBytes, stream>>>(
       tma.x, tma.w, tma.sfa, tma.sfb, tma_partial_output,
-      groups, m, n, k, split_k);
+      n, k);
   if (cudaPeekAtLastError() != cudaSuccess) {
     return GemmStatus::kCudaError;
   }
 
   const int64_t output_elements =
       static_cast<int64_t>(groups) * m * n;
+  const int64_t output_pairs = output_elements / 2;
   const int64_t required_reduction_blocks =
-      (output_elements + kReductionThreads - 1) / kReductionThreads;
+      (output_pairs + kReductionThreads - 1) / kReductionThreads;
   const int reduction_blocks = static_cast<int>(std::min<int64_t>(
       required_reduction_blocks,
       static_cast<int64_t>(properties.multiProcessorCount) * 4));
-  reduce_splitk_kernel<<<
+  reduce_m256_split2_half2_kernel<<<
       reduction_blocks, kReductionThreads, 0, stream>>>(
-      static_cast<const float*>(workspace), output,
-      output_elements, split_k);
+      static_cast<const float*>(workspace), output, output_elements);
   return cudaPeekAtLastError() == cudaSuccess
              ? GemmStatus::kSuccess
              : GemmStatus::kCudaError;
 }
 
-}  // namespace sm120_nvfp4::splitk_experiment
+}  // namespace sm120_nvfp4::gemm_specialized::m256

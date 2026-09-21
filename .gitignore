@@ -7,3 +7,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+*.ncu-rep
+*.nsys-rep
+/nsys_*.sqlite
+/gemm_m*.json
+/README_LEARNING_HANDOFF.md
+/README_OPERATOR_ROADMAP.md
