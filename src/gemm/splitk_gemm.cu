@@ -9,6 +9,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "cute/atom/mma_traits_sm90_gmma.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/arch/reg_reconfig.h"
@@ -28,6 +29,13 @@ constexpr int kReductionThreads = 256;
 constexpr int kPartialStoreRows = 64;
 
 using Config = detail::Nvfp4GemmConfig<float, kTileM, kTileN, kTileK, kStages>;
+using PartialOutputSmemLayout = decltype(tile_to_shape(
+    GMMA::Layout_K_SW128_Atom<float>{},
+    Shape<Int<kPartialStoreRows>, Int<kTileN>>{}));
+
+static_assert(size(PartialOutputSmemLayout{}) ==
+                  kPartialStoreRows * kTileN,
+              "The swizzled partial-output layout must cover one store slab");
 
 template <typename GemmConfig, typename TmaPartialOutput>
 __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
@@ -50,13 +58,12 @@ __global__ void __launch_bounds__(kThreads, 1) nvfp4_splitk_partial_kernel(
   constexpr int kConfigTileK = GemmConfig::kTileK;
   constexpr int kConfigStages = GemmConfig::kStage;
   constexpr int kMathThreads = size(TiledMma{});
-  using PartialOutputSmemLayout = Layout<
-      Shape<Int<kPartialStoreRows>, Int<kConfigTileN>>,
-      Stride<Int<kConfigTileN>, _1>>;
   constexpr int kPartialOutputSmemOffset =
       (sizeof(TensorStorage) + 127) / 128 * 128;
   static_assert(kMathThreads == 256,
                 "SM120 cooperative NVFP4 MMA requires 256 math threads");
+  static_assert(kConfigTileN == kTileN,
+                "The partial-output shared layout is specialized for tile N=128");
   static_assert(kConfigTileM % kPartialStoreRows == 0,
                 "The partial-output tile must split evenly into TMA stores");
 
@@ -438,10 +445,6 @@ GemmStatus launch(
   auto tma = config.get_tma(input, weight, input_scale, weight_scale);
   // Flatten (split, group) into one batch coordinate while preserving the
   // workspace layout [split][group][m][n].
-  using PartialOutputSmemLayout = cute::Layout<
-      cute::Shape<cute::Int<kPartialStoreRows>,
-                  cute::Int<Config::kTileN>>,
-      cute::Stride<cute::Int<Config::kTileN>, cute::_1>>;
   auto partial_output = cute::make_tensor(
       cute::make_gmem_ptr(static_cast<float*>(workspace)),
       cute::make_shape(
