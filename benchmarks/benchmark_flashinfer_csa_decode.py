@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """DSV4-Flash-shaped CSA decode baseline through FlashInfer's public SM120 API.
 
-Run on the GPU server using the pinned FlashInfer source installation. No local
+Run on the GPU server using a reviewed FlashInfer source revision. No local
 operator build is needed. Inputs are synthetic, post-compression/post-RoPE
 vectors; neither model weights nor an indexer/compressor are executed here.
 Each request has an independent SWA and compressed cache. Only decode is timed.
@@ -28,7 +28,12 @@ from flashinfer.mla import (
 )
 
 
-FLASHINFER_COMMIT = "37b4d30eac39b89f198b893dd11914bd76f5fcf8"
+# The sparse MLA API, private planner, NVFP4 layout and SM120 kernels are
+# unchanged between these revisions. Record the actual revision in every run.
+REVIEWED_FLASHINFER_COMMITS = (
+    "37b4d30eac39b89f198b893dd11914bd76f5fcf8",
+    "ea728cb558c32a3c58ec8fbd5a154ff676b9ab70",
+)
 HEADS, DIM, SWA, TOPK, COMPRESSION = 64, 512, 128, 512, 4
 PAGE_SIZE, PACKED_BYTES = 64, 384
 
@@ -73,10 +78,11 @@ def git_value(directory: Path, *arguments: str) -> str:
 def environment() -> dict:
     source = Path(flashinfer.__file__).resolve().parent.parent
     commit = git_value(source, "rev-parse", "HEAD")
-    if commit != FLASHINFER_COMMIT:
+    if commit not in REVIEWED_FLASHINFER_COMMITS:
         raise RuntimeError(
-            f"Expected FlashInfer {FLASHINFER_COMMIT}, got {commit} at {source}. "
-            "Activate the environment containing that source installation."
+            f"FlashInfer revision {commit} at {source} has not been reviewed "
+            f"for this harness. Reviewed revisions: {', '.join(REVIEWED_FLASHINFER_COMMITS)}. "
+            "Check sparse MLA API and cache-layout compatibility before adding a revision."
         )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable")
@@ -85,7 +91,7 @@ def environment() -> dict:
         raise RuntimeError("This baseline requires SM120/SM121")
     patch = git_value(source, "diff", "HEAD", "--", "flashinfer", "include", "csrc")
     if patch:
-        raise RuntimeError("FlashInfer runtime sources differ from the pinned commit")
+        raise RuntimeError("FlashInfer runtime sources differ from the checked-out commit")
     return {
         "python": sys.version,
         "python_executable": sys.executable,
@@ -133,7 +139,7 @@ def build_cache(batch: int, rows: int, seed: int, selected: torch.Tensor,
 
 
 def dequantize_selected(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
-    """Read selected rows of the pinned 384-byte NVFP4 FOOTER ABI."""
+    """Read selected rows of the reviewed 384-byte NVFP4 FOOTER ABI."""
     flat = cache.view(cache.shape[0], -1)
     pages, rows = slots.long() // PAGE_SIZE, slots.long() % PAGE_SIZE
     data = flat[pages[:, None], rows[:, None] * 352 + torch.arange(352, device="cuda")]
@@ -168,7 +174,7 @@ def errors(actual: torch.Tensor, expected: torch.Tensor) -> dict:
 def inspect_public_plan(q, swa_cache, swa_ids, output, swa_lengths, sink,
                         comp_cache, comp_ids, comp_lengths):
     # Read the same metadata-keyed plan used by the public facade. This private
-    # diagnostic is why this script pins the exact FlashInfer source commit.
+    # diagnostic is why this script accepts only reviewed source revisions.
     from flashinfer.mla._sparse_mla_sm120 import _prepared
 
     tensors = (q[:, 0], swa_cache, swa_ids, output[:, 0], swa_lengths, sink,

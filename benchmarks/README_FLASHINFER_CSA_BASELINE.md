@@ -5,10 +5,18 @@ for B=64, 256 and 1024. Run it on the GPU server from this project's checkout,
 using the Python environment in which FlashInfer's upstream tests passed.
 The project extension does not need to be built for this script.
 
-The required FlashInfer source commit is
-`37b4d30eac39b89f198b893dd11914bd76f5fcf8`. The script checks the imported source
-location, commit and tracked runtime-source changes. Private plan inspection and
-NVFP4 cache decoding are specific to that commit.
+The reviewed FlashInfer source revisions are:
+
+- `37b4d30eac39b89f198b893dd11914bd76f5fcf8` (initial local reference).
+- `ea728cb558c32a3c58ec8fbd5a154ff676b9ab70` (the user's server installation).
+
+The sparse MLA API, private planner, NVFP4 cache layout, SM120 sparse kernels
+and upstream NVFP4 test file are unchanged between these revisions. There is
+no need to downgrade the server installation. The script checks the imported
+source location, revision and tracked runtime-source changes, and records the
+actual revision in its output. Keep that revision fixed for performance
+comparisons. Additional revisions require source review because the harness
+uses private plan inspection and cache decoding.
 
 ## Run
 
@@ -109,7 +117,11 @@ present in the JSON.
 ## Validation status
 
 The user reported `84 passed in 2.32s` for the upstream
-`tests/attention/test_sparse_mla_sm120_dsv4_nvfp4.py` on the server. The new
-benchmark harness has been reviewed against the pinned source but has not yet
-been executed. All compilation, tests and performance measurements are performed
-by the user on the server; local WSL is used for editing and source review.
+`tests/attention/test_sparse_mla_sm120_dsv4_nvfp4.py` on the server. The first
+harness run stopped at the revision check, before any GPU benchmark, because
+the server uses `ea728cb558c32a3c58ec8fbd5a154ff676b9ab70`. Source comparison
+confirmed the compatibility described above, and that revision is now accepted.
+The updated harness still needs to be run on the server; there are no measured
+baseline results yet. All compilation, tests and performance measurements are
+performed by the user on the server; local WSL is used for editing and source
+review.
