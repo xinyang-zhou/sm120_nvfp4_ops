@@ -1,8 +1,9 @@
 # DS-V4 CSA sparse MLA decode on SM120
 
 Status: implementation prepared in WSL; **not compiled, tested or benchmarked
-locally**. Server validation is required. The former dense/paged decode APIs
-and kernels have been removed. Dense prefill remains available.
+locally**. Server validation is required. The former dense prefill and
+dense/paged decode APIs, kernels and tests have been removed. Sparse MLA is
+the repository's attention implementation.
 
 The numerical design is recorded in [attention_decode_math.tex](attention_decode_math.tex),
 a snapshot of `/home/xinyang/attention.tex`. This implements the attention core:
@@ -112,7 +113,7 @@ recommended if the installed CUDA headers do not provide `cuda_fp4.h`.
 
 ```bash
 git fetch origin
-git switch feat/dsv4-cute-sparse-mla
+git switch main
 git pull --ff-only
 mkdir -p artifacts/sparse_mla
 set -o pipefail
@@ -121,14 +122,12 @@ nvidia-smi > artifacts/sparse_mla/nvidia-smi.txt
 bash scripts/build.sh 2>&1 | tee artifacts/sparse_mla/build.log
 export PYTHONPATH="$PWD/build/python${PYTHONPATH:+:$PYTHONPATH}"
 python3 -c 'import torch; assert torch.cuda.get_device_capability() == (12, 0)'
-python3 -m unittest discover -s tests/python -p test_attention.py -v \
-  2>&1 | tee artifacts/sparse_mla/prefill.log
 python3 -m unittest discover -s tests/python -p test_sparse_mla.py -v \
   2>&1 | tee artifacts/sparse_mla/sparse_mla.log
 ```
 
-Required gates: build succeeds; all non-optional sparse and retained prefill
-tests pass on SM120 (not skip). The sparse suite checks all 64 heads, random
+Required gates: build succeeds; all non-optional sparse tests pass on SM120
+(not skip). The sparse suite checks all 64 heads, random
 per-block scales, tails, masked/repeated/out-of-range indices, lengths, empty
 pools/splits, zero scales, denominator precision, BF16 RoPE, large logits,
 sink, split rounding, buffer reuse, API validation and CUDA Graph replay.

@@ -61,7 +61,6 @@ target_link_libraries(
   sm120_nvfp4_grouped_gemm PUBLIC sm120_nvfp4_common CUDA::cudart)
 
 add_library(sm120_nvfp4_attention STATIC
-  src/attention/attention.cu
   src/attention/sparse_mla/decode.cu)
 sm120_nvfp4_configure_target(sm120_nvfp4_attention)
 target_link_libraries(
@@ -91,7 +90,6 @@ if(SM120_NVFP4_BUILD_TORCH)
   endif()
   add_library(_C MODULE
     bindings/gemm_ops.cu
-    bindings/attention_ops.cpp
     bindings/sparse_mla_ops.cpp
     bindings/grouped_gemm_ops.cpp
     bindings/fused_moe_ops.cpp)

@@ -125,52 +125,11 @@ Before Custom CuTe was added, `nvfp4_gemm_sm120` referred to the CUTLASS Collect
 
 Consequently, the historical M=512 result means “configured CUTLASS Collective exceeded the selected cuBLASLt heuristic on this shape,” not “the repository-owned Custom CuTe kernel exceeded cuBLASLt.”
 
-## Dense and paged decode attention
+## DS-V4 CSA sparse MLA decode
 
-Historical results from the removed implementation. These do not measure the
-new DS-V4 sparse MLA kernel; its validation/benchmark entry is documented in
-[Sparse MLA](SPARSE_MLA.md). Check out commit `539688c` to recover the old
-decode implementation and benchmark command below.
-
-The decode benchmark compares the repository's fused single-token dense and
-paged KV paths. Both paths use native SM120 NVFP4 MMA for QK and PV, online
-FP32 softmax, the same random packed E2M1 logical tensors, and preallocated
-output/workspace buffers. The paged input is the dense logical cache split
-into physical pages and addressed through an `int32` block table. Before
-timing, every paged output element is checked against the dense result with
-zero tolerance.
-
-Configuration: RTX 5090 GPU 0, driver 595.84, CUDA Toolkit 13.2, PyTorch CUDA
-12.8, `Hq=32`, `Hkv=8`, `N=1024`, `D=Dv=128`, 30 warmups and 300 CUDA Event
-iterations.
-
-| Batch | Page size | Dense latency | Paged latency | Paged / Dense | Max diff |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 32 | 18.28 us | 31.39 us | 1.72x | 0 |
-| 1 | 64 | 18.10 us | 30.46 us | 1.68x | 0 |
-| 1 | 128 | 17.96 us | 29.94 us | 1.67x | 0 |
-| 8 | 32 | 22.89 us | 109.81 us | 4.80x | 0 |
-| 8 | 64 | 22.90 us | 107.45 us | 4.69x | 0 |
-| 8 | 128 | 22.87 us | 106.43 us | 4.65x | 0 |
-
-The dense path can issue contiguous TMA transfers for K/V. The initial paged
-implementation instead gathers packed bytes and scale factors through the
-block table into the MMA shared-memory layout. The measured gap therefore
-quantifies the current general gather overhead; it is not caused by
-materializing a dense cache or full logits/probabilities. Page-size
-specialization, cached physical-page lookup, and wider layout-aware memory
-transactions are the next optimization targets.
-
-Raw results:
-[attention_decode_rtx5090_2026-09-13.json](../benchmarks/results/attention_decode_rtx5090_2026-09-13.json).
-
-```bash
-PYTHONPATH="$PWD/build/python" \
-python benchmarks/benchmark_attention_decode.py \
-  --batches 1,8 --block-sizes 32,64,128 \
-  --warmup 30 --iterations 300 \
-  --output benchmarks/results/attention_decode_rtx5090_YYYY-MM-DD.json
-```
+The new C++ CuTe sparse MLA kernel has not yet been compiled, tested or
+benchmarked on the GPU server. See [Sparse MLA](SPARSE_MLA.md) for its
+numerical reference, validation gates and reproducible FlashInfer A/B commands.
 
 ## Generated instruction verification
 

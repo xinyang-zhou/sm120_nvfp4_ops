@@ -40,70 +40,6 @@ def cutlass_gemm(
     return torch.ops.sm120_nvfp4.cutlass_gemm(a, b, sfa, sfb)
 
 
-def attention_workspace_bytes(
-    batch: int,
-    heads: int,
-    query_length: int,
-    kv_length: int,
-) -> int:
-    """Return reusable scratch bytes for :func:`attention_prefill`."""
-    if min(batch, heads, query_length, kv_length) <= 0:
-        raise ValueError("attention dimensions must be positive")
-    if kv_length % 32:
-        raise ValueError("kv_length must be a multiple of 32")
-
-    alignment = 256
-    matrices = batch * heads
-    total = 0
-
-    def reserve(size: int) -> None:
-        nonlocal total
-        total = ((total + alignment - 1) // alignment) * alignment
-        total += size
-
-    reserve(matrices * query_length * kv_length * 4)
-    reserve(matrices * query_length * kv_length // 2)
-    reserve(matrices * scale_a_elements(query_length, 1, kv_length))
-    reserve(matrices * query_length * 4)
-    return ((total + alignment - 1) // alignment) * alignment
-
-
-def attention_prefill(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value_transposed: torch.Tensor,
-    query_scale: torch.Tensor,
-    key_scale: torch.Tensor,
-    value_scale: torch.Tensor,
-    *,
-    causal: bool = True,
-    softmax_scale: Optional[float] = None,
-    output: Optional[torch.Tensor] = None,
-    workspace: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Run dense SM120 NVFP4 prefill attention.
-
-    Packed shapes are ``query[B,H,M,D/2]``, ``key[B,H,N,D/2]`` and
-    ``value_transposed[B,H,Dv,N/2]``. Softmax is FP32; both matrix products
-    use native SM120 NVFP4 block-scaled MMA.
-    """
-    if softmax_scale is None:
-        logical_head_dim = int(query.shape[-1]) * 2
-        softmax_scale = logical_head_dim**-0.5
-    return torch.ops.sm120_nvfp4.attention_prefill(
-        query,
-        key,
-        value_transposed,
-        query_scale,
-        key_scale,
-        value_scale,
-        causal,
-        softmax_scale,
-        output,
-        workspace,
-    )
-
-
 def sparse_mla_decode_workspace_bytes(
     batch: int,
     swa_candidates: int = 128,
@@ -322,8 +258,6 @@ def scale_b_elements(m: int, n: int, k: int) -> int:
 __all__ = [
     "sparse_mla_decode",
     "sparse_mla_decode_workspace_bytes",
-    "attention_prefill",
-    "attention_workspace_bytes",
     "expert_moe",
     "expert_moe_workspace_bytes",
     "fused_moe",

@@ -14,7 +14,7 @@ Layer 1: Single GEMM
                     |
           ┌─────────┴──────────┐
           v                    v
-Layer 2A: Dense Attention   Layer 2B: Persistent Grouped GEMM
+Layer 2A: DS-V4 Sparse MLA  Layer 2B: Persistent Grouped GEMM
   QK^T -> softmax -> P@V      dynamic expert M + shared N/K
                                |
                                v
@@ -57,7 +57,7 @@ dense row-major FP16 shared-memory tile. After a named-barrier and async-shared
 fence, one elected thread issues `SM90_TMA_STORE`; the producer warpgroup may
 continue filling the disjoint mainloop buffers. TensorMap bounds discard
 residue outside M/N. A second named-barrier prevents reuse of the single
-epilogue tile before the store completes. FP32 output, used by prefill logits,
+epilogue tile before the store completes. FP32 output
 retains the direct predicated path because a full FP32 staging tile would
 exceed the useful shared-memory budget.
 
@@ -74,9 +74,8 @@ The two implementations live under
 matrices in caller-owned workspace and use a second kernel to reduce and
 convert to FP16. The split counts are fixed, not runtime tuning parameters.
 The M=256 path additionally fixes its tile-to-task mapping and uses a
-vectorized `half2` reduction. Attention continues to call the explicit
-generic FP16/FP32 and batched interfaces; it is not redirected through this
-single-GEMM dispatcher.
+vectorized `half2` reduction. Sparse MLA uses its own fused CuTe kernel
+and does not call this single-GEMM dispatcher.
 
 `cuobjdump` confirms that this repository-owned kernel contains:
 
@@ -115,30 +114,10 @@ The single kernel specializes scheduling for one matrix. Grouped GEMM adds runti
 
 ## Attention
 
-### Prefill
-
-The first SM120 attention path borrows the numerical decomposition used by
-high-performance prefill kernels while replacing SM90 WGMMA with this
-repository's SM120 block-scaled MMA:
-
-1. each `(batch, head)` computes packed NVFP4 `QK^T` with FP32 output;
-2. one CUDA block per query row applies suffix-aligned causal masking and a
-   stable FP32 max/sum softmax;
-3. each 16-element probability vector is dynamically quantized to E2M1 with
-   a UE4M3 scale in the CUTLASS SFA physical layout;
-4. each `(batch, head)` computes NVFP4 `P@V` into FP16;
-5. a final row correction divides by the reconstructed NVFP4 probability sum.
-
-This preserves the attention normalization invariant while letting both
-matrix products use `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`. The current path
-is a correctness-oriented first implementation: FP32 logits and packed
-probabilities live in caller-reusable workspace, and GEMMs are launched per
-head. A future fused schedule can tile QK, online softmax and PV without
-changing the public operand/scale contract.
-
 ### DS-V4 CSA sparse decode
 
-The former dense/paged decode implementation has been removed. Its replacement
+The former dense prefill and dense/paged decode implementations have been
+removed. The DS-V4 sparse MLA implementation
 uses C++ CuTe warp MMA atoms for 448 NVFP4 non-RoPE channels and 64 BF16 RoPE
 channels, with FP32 online softmax and register-resident output accumulation.
 One CTA handles all 64 query heads and a range of 64-candidate chunks from
@@ -223,7 +202,7 @@ Uniform tests can fill the physical allocation with one UE4M3 byte. Non-uniform 
 - `src/gemm/`: default dispatcher, generic/specialized Custom CuTe kernels,
   and isolated CUTLASS reference;
 - `src/grouped_gemm/`: dynamic expert scheduling and compute kernel;
-- `src/attention/`: materialized prefill plus DS-V4 sparse MLA decode;
+- `src/attention/`: DS-V4 CSA sparse MLA decode;
 - `bindings/`: validation, allocation and PyTorch registration;
 - `tests/`: correctness and adversarial routing/layout cases;
 - `benchmarks/`: performance comparisons, never imported by the library.

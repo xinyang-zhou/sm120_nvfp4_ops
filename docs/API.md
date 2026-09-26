@@ -107,71 +107,15 @@ torch.ops.sm120_nvfp4.cute_gemm
 torch.ops.sm120_nvfp4.cutlass_gemm
 ```
 
-## Dense NVFP4 prefill attention
-
-Both matrix products use the repository-owned SM120 block-scaled MMA:
-
-```text
-logits = Q_nvfp4 @ K_nvfp4^T                  (FP32 output)
-P       = softmax(logits * softmax_scale)     (FP32)
-P_nvfp4 = dynamic_quantize(P, groups_of_16)   (E2M1 + UE4M3)
-output  = P_nvfp4 @ V_transposed_nvfp4^T      (FP16)
-output *= 1 / sum(dequantize(P_nvfp4), axis=N)
-```
-
-The final correction restores the probability-row normalization lost during
-E2M1 quantization. It does not remove relative per-element quantization error.
-
-Packed shapes and scale-region sizes per `(batch, head)` are:
-
-```text
-query              [B, H, M,  D/2]
-key                [B, H, N,  D/2]
-value_transposed   [B, H, Dv, N/2]
-query_scale        B*H * scale_a_elements(M, N,  D)
-key_scale          B*H * scale_b_elements(M, N,  D)
-value_scale        B*H * scale_b_elements(M, Dv, N)
-output             [B, H, M, Dv] float16
-```
-
-`value_transposed` stores rows of `V^T`, because the SM120 GEMM contract is
-`A[M,K] @ B[N,K]^T`. Constraints are `D % 32 == 0`, `N % 32 == 0`, and
-`Dv % 8 == 0`. With `causal=True`, `M <= N` and row `r` can see KV columns
-through `N-M+r`, matching suffix-aligned prefill semantics.
-
-```python
-workspace = torch.empty(
-    sm120_nvfp4.attention_workspace_bytes(B, H, M, N),
-    dtype=torch.uint8,
-    device=query.device,
-)
-output = sm120_nvfp4.attention_prefill(
-    query, key, value_transposed,
-    query_scale, key_scale, value_scale,
-    causal=True,
-    softmax_scale=D**-0.5,  # default when omitted
-    workspace=workspace,
-)
-```
-
-The C++ declarations are in `sm120_nvfp4/attention.hpp`. The workspace holds
-FP32 logits, packed probability payloads, probability scales and FP32 row
-corrections; the query function returns the exact required byte count.
-
-This implementation materializes logits and probabilities and launches GEMMs
-per `(B,H)` matrix. An end-to-end persistent/fused schedule is not yet part of
-the API.
-
 ## DS-V4 CSA sparse MLA decode
 
-The old `attention_decode`, `attention_paged_decode`, and their workspace API
-have been removed. Use `sparse_mla_decode` with BF16 query/output, shared-latent
-NVFP4 caches and explicit SWA/compressed physical slot lists. This is a new
-contract, not a drop-in replacement for separate K/transposed-V tensors.
+The legacy dense prefill and dense/paged decode APIs have been removed.
+Use `sparse_mla_decode` with BF16 query/output, shared-latent NVFP4 caches
+and explicit SWA/compressed physical slot lists.
 
 See [Sparse MLA](SPARSE_MLA.md) for cache ABI, precision, masking, workspace,
 examples and server validation. C++ declarations are in
-`sm120_nvfp4/sparse_mla.hpp`. Dense prefill remains unchanged.
+`sm120_nvfp4/sparse_mla.hpp`.
 
 ## C++ Grouped GEMM
 
