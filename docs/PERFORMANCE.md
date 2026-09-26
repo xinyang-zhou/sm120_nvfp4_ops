@@ -127,6 +127,11 @@ Consequently, the historical M=512 result means “configured CUTLASS Collective
 
 ## Dense and paged decode attention
 
+Historical results from the removed implementation. These do not measure the
+new DS-V4 sparse MLA kernel; its validation/benchmark entry is documented in
+[Sparse MLA](SPARSE_MLA.md). Check out commit `539688c` to recover the old
+decode implementation and benchmark command below.
+
 The decode benchmark compares the repository's fused single-token dense and
 paged KV paths. Both paths use native SM120 NVFP4 MMA for QK and PV, online
 FP32 softmax, the same random packed E2M1 logical tensors, and preallocated

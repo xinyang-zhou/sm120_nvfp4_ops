@@ -113,7 +113,7 @@ Single and Grouped GEMM share [`Nvfp4GemmConfig`](../src/common/gemm_config.cuh)
 
 The single kernel specializes scheduling for one matrix. Grouped GEMM adds runtime TensorMap patching and expert-aware tile traversal without changing the MMA contract.
 
-## Dense attention
+## Attention
 
 ### Prefill
 
@@ -136,37 +136,17 @@ probabilities live in caller-reusable workspace, and GEMMs are launched per
 head. A future fused schedule can tile QK, online softmax and PV without
 changing the public operand/scale contract.
 
-### Decode
+### DS-V4 CSA sparse decode
 
-Single-token dense decode uses a fused 128-token streaming schedule. The
-`Hq/Hkv` query heads sharing one cache head become the MMA M dimension. Within
-each CTA, TMA feeds native SM120 NVFP4 QK, the resulting FP32 tile is consumed
-by online softmax, probabilities are quantized into shared-memory E2M1/UE4M3,
-and a second native NVFP4 MMA accumulates PV. The same 64 KiB shared-memory
-region is reused for Q/K storage and the temporary logits tile, so neither
-full logits nor full probabilities reach global memory.
-
-Low-occupancy requests split the KV sequence across CTAs and use a stable
-LSE-weighted combine. Each split writes only an output-sized FP32 partial and one
-LSE per query head; a small combine kernel applies stable LSE weights. GQA/MQA
-reuses packed K/V without expansion. Per-head query scales are repacked into
-grouped tiles in reusable workspace. Device `kv_lengths[B]` supplies the last
-valid position without host synchronization.
-
-The SM120 implementation organizes online softmax and split-K/LSE around
-block-scaled `OMMA.SF` for both QK and PV; it does not reuse an SM90 WGMMA
-schedule.
-
-The paged entry point adds block-table indirection without
-materializing a dense cache. Physical caches are `[P,Hkv,S,D]` for K and
-`[P,Hkv,Dv,S]` for transposed V, with `S` equal to 32, 64, or 128. A CTA maps
-each logical 128-token tile to its physical pages, loads complete packed E2M1
-byte pairs into the same swizzled B-operand shared layout, and loads the
-corresponding per-page SFB metadata. Handling both nibbles in one thread is
-required: independent subbyte stores would race on a shared packed byte.
-After that load, paged and dense decode share the same native QK, online
-softmax, probability quantization, native PV, and LSE combine code. MTP and a
-dynamic device task map remain the next decode extensions.
+The former dense/paged decode implementation has been removed. Its replacement
+uses C++ CuTe warp MMA atoms for 448 NVFP4 non-RoPE channels and 64 BF16 RoPE
+channels, with FP32 online softmax and register-resident output accumulation.
+One CTA handles all 64 query heads and a range of 64-candidate chunks from
+SWA and compressed shared-KV caches. Raw KV is asynchronously double buffered;
+V is requantized along the gathered candidate axis inside the CTA. Split
+outputs are BF16, LSE is FP32, and the sink enters the final denominator once.
+See [Sparse MLA](SPARSE_MLA.md) for the source/math mapping and validation
+status. The new kernel has not yet been compiled or tested on the server.
 
 ## Grouped GEMM
 
@@ -243,7 +223,7 @@ Uniform tests can fill the physical allocation with one UE4M3 byte. Non-uniform 
 - `src/gemm/`: default dispatcher, generic/specialized Custom CuTe kernels,
   and isolated CUTLASS reference;
 - `src/grouped_gemm/`: dynamic expert scheduling and compute kernel;
-- `src/attention/`: materialized prefill plus fused streaming/split-K decode;
+- `src/attention/`: materialized prefill plus DS-V4 sparse MLA decode;
 - `bindings/`: validation, allocation and PyTorch registration;
 - `tests/`: correctness and adversarial routing/layout cases;
 - `benchmarks/`: performance comparisons, never imported by the library.

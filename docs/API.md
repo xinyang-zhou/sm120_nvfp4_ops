@@ -162,106 +162,16 @@ This implementation materializes logits and probabilities and launches GEMMs
 per `(B,H)` matrix. An end-to-end persistent/fused schedule is not yet part of
 the API.
 
-## Dense NVFP4 decode attention
+## DS-V4 CSA sparse MLA decode
 
-The decode entry point handles one query token per request and supports GQA
-and MQA without expanding the KV cache:
+The old `attention_decode`, `attention_paged_decode`, and their workspace API
+have been removed. Use `sparse_mla_decode` with BF16 query/output, shared-latent
+NVFP4 caches and explicit SWA/compressed physical slot lists. This is a new
+contract, not a drop-in replacement for separate K/transposed-V tensors.
 
-```text
-query                    [B, Hq, D/2]
-key_cache                [B, Hkv, N, D/2]
-value_cache_transposed   [B, Hkv, Dv, N/2]
-kv_lengths               [B] int32 CUDA, optional
-output                   [B, Hq, Dv] float16
-```
-
-`Hq % Hkv == 0`. Consecutive groups of `Hq/Hkv` query heads directly reuse
-one KV head's packed payload and scales. `N` is padded cache capacity;
-`kv_lengths[b]` masks positions at or beyond the request's current length.
-When omitted, all `N` positions are valid.
-
-Scale sizes are:
-
-```text
-query_scale  B*Hq  * scale_a_elements(1, N,  D)
-key_scale    B*Hkv * scale_b_elements(1, N,  D)
-value_scale  B*Hkv * scale_b_elements(1, Dv, N)
-```
-
-```python
-workspace = torch.empty(
-    sm120_nvfp4.attention_decode_workspace_bytes(B, Hq, Hkv, N, D, Dv),
-    dtype=torch.uint8,
-    device=query.device,
-)
-output = sm120_nvfp4.attention_decode(
-    query, key_cache, value_cache_transposed,
-    query_scale, key_scale, value_scale,
-    kv_lengths=kv_lengths,
-    softmax_scale=D**-0.5,  # default when omitted
-    workspace=workspace,
-)
-```
-
-The decode kernel groups the `Hq/Hkv` query heads sharing one KV head into the
-M dimension and streams over 128-token KV tiles. Each tile performs native
-SM120 NVFP4 QK, online FP32 softmax, tile-local E2M1/UE4M3 probability
-quantization, and native NVFP4 PV before the tile storage is reused. No full
-`[B,Hq,N]` logits or probability tensor is written to global memory.
-
-For small request counts, the sequence is split across CTAs. Workspace holds
-only grouped query scales, FP32 `[B,Hq,splits,Dv]` partial outputs, and
-`[B,Hq,splits]` LSE values; a second kernel combines them stably. Packed K/V
-payloads remain unexpanded. Paged block tables and multi-token prediction are
-not part of this dense API.
-
-## Paged NVFP4 decode attention
-
-`attention_paged_decode` keeps the same single-token GQA/MQA and split-K
-semantics, but resolves logical tokens through a device block table:
-
-```text
-query                    [B, Hq, D/2]
-key_cache                [P, Hkv, S, D/2]
-value_cache_transposed   [P, Hkv, Dv, S/2]
-block_table              [B, max_blocks] int32 CUDA
-kv_lengths               [B] int32 CUDA
-output                   [B, Hq, Dv] float16
-```
-
-`S` is 32, 64, or 128 and `N = max_blocks * S`. Logical token `t` of
-request `b` comes from physical page `block_table[b,t//S]` at offset `t%S`.
-Entries covering the active `ceil(kv_lengths[b]/S)` pages must be in `[0,P)`.
-Physical pages may be shared or appear in any order.
-
-Each `(physical page, KV head)` owns an independent CUTLASS SFB region:
-
-```text
-query_scale  B*Hq  * scale_a_elements(1, N,  D)
-key_scale    P*Hkv * scale_b_elements(1, S,  D)
-value_scale  P*Hkv * scale_b_elements(1, Dv, S)
-```
-
-```python
-workspace = torch.empty(
-    sm120_nvfp4.attention_decode_workspace_bytes(B, Hq, Hkv, N, D, Dv),
-    dtype=torch.uint8,
-    device=query.device,
-)
-output = sm120_nvfp4.attention_paged_decode(
-    query, key_cache, value_cache_transposed,
-    query_scale, key_scale, value_scale,
-    block_table, kv_lengths,
-    softmax_scale=D**-0.5,
-    workspace=workspace,
-)
-```
-
-The CTA reads complete packed E2M1 byte pairs through the block table and
-places them directly in the existing swizzled QK/PV shared-memory tiles.
-This avoids expanding the cache to `[B,Hkv,N,*]`; online FP32 softmax,
-tile-local probability quantization, native SM120 NVFP4 QK/PV, and LSE
-combine are shared with dense decode.
+See [Sparse MLA](SPARSE_MLA.md) for cache ABI, precision, masking, workspace,
+examples and server validation. C++ declarations are in
+`sm120_nvfp4/sparse_mla.hpp`. Dense prefill remains unchanged.
 
 ## C++ Grouped GEMM
 

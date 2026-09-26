@@ -104,119 +104,71 @@ def attention_prefill(
     )
 
 
-def attention_decode_workspace_bytes(
+def sparse_mla_decode_workspace_bytes(
     batch: int,
-    query_heads: int,
-    kv_heads: int,
-    max_kv_length: int,
-    head_dim: int,
-    value_dim: int,
+    swa_candidates: int = 128,
+    compressed_candidates: int = 512,
+    chunks_per_cta: int = 0,
 ) -> int:
-    """Return reusable scratch bytes for :func:`attention_decode`."""
-    if min(batch, query_heads, kv_heads, max_kv_length, head_dim, value_dim) <= 0:
-        raise ValueError("decode dimensions must be positive")
-    if query_heads % kv_heads:
-        raise ValueError("query_heads must be divisible by kv_heads")
-    if max_kv_length % 32 or head_dim % 32:
-        raise ValueError("max_kv_length and head_dim must be multiples of 32")
-    if value_dim % 8:
-        raise ValueError("value_dim must be a multiple of 8")
+    """BF16 split outputs + FP32 base-2 split LSE; zero for a single CTA.
 
-    alignment = 256
-    matrices = batch * query_heads
-    groups = batch * kv_heads
-    rows_per_group = query_heads // kv_heads
-    row_tiles = (rows_per_group + 127) // 128
-    sequence_tiles = (max_kv_length + 127) // 128
-    tasks = groups * row_tiles
-    splits = min(sequence_tiles, max(1, (128 + tasks - 1) // tasks))
-    total = 0
-
-    def reserve(size: int) -> None:
-        nonlocal total
-        total = ((total + alignment - 1) // alignment) * alignment
-        total += size
-
-    reserve(groups * scale_a_elements(rows_per_group, max_kv_length, head_dim))
-    reserve(matrices * splits * value_dim * 4)
-    if splits > 1:
-        reserve(matrices * splits * 4)
-    return ((total + alignment - 1) // alignment) * alignment
-
-
-def attention_decode(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache_transposed: torch.Tensor,
-    query_scale: torch.Tensor,
-    key_scale: torch.Tensor,
-    value_scale: torch.Tensor,
-    *,
-    kv_lengths: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    output: Optional[torch.Tensor] = None,
-    workspace: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Run single-token dense SM120 NVFP4 decode attention with GQA/MQA.
-
-    Packed shapes are ``query[B,Hq,D/2]``, ``key_cache[B,Hkv,N,D/2]``
-    and ``value_cache_transposed[B,Hkv,Dv,N/2]``. ``kv_lengths`` is an
-    optional CUDA int32 tensor of shape ``[B]``.
+    The default uses at most nine chunks/CTA for B<=64, all chunks otherwise.
+    This reproduces the initial attention.tex schedule; it is not autotuned.
     """
-    if softmax_scale is None:
-        logical_head_dim = int(query.shape[-1]) * 2
-        softmax_scale = logical_head_dim**-0.5
-    return torch.ops.sm120_nvfp4.attention_decode(
-        query,
-        key_cache,
-        value_cache_transposed,
-        query_scale,
-        key_scale,
-        value_scale,
-        kv_lengths,
-        softmax_scale,
-        output,
-        workspace,
-    )
+    if not 1 <= batch <= 1048576:
+        raise ValueError("batch must be in [1,1048576]")
+    if not (0 <= swa_candidates <= 1048576 and 0 <= compressed_candidates <= 1048576):
+        raise ValueError("candidate capacities must be in [0,1048576]")
+    if not 0 <= chunks_per_cta <= 2147483647:
+        raise ValueError("chunks_per_cta must be a nonnegative int32")
+    chunks = max(1, (swa_candidates + 63) // 64 + (compressed_candidates + 63) // 64)
+    cpb = min(chunks_per_cta, chunks) if chunks_per_cta else (min(9, chunks) if batch <= 64 else chunks)
+    splits = (chunks + cpb - 1) // cpb
+    return batch * 64 * splits * (512 * 2 + 4) if splits > 1 else 0
 
 
-def attention_paged_decode(
+def sparse_mla_decode(
     query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache_transposed: torch.Tensor,
-    query_scale: torch.Tensor,
-    key_scale: torch.Tensor,
-    value_scale: torch.Tensor,
-    block_table: torch.Tensor,
-    kv_lengths: torch.Tensor,
+    swa_cache: torch.Tensor,
+    compressed_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    compressed_indices: torch.Tensor,
     *,
-    softmax_scale: Optional[float] = None,
+    swa_lengths: Optional[torch.Tensor] = None,
+    compressed_lengths: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
+    chunks_per_cta: int = 0,
+    softmax_scale: float = 512**-0.5,
+    lse_scale: float = 1.0,
     output: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Run fused single-token paged SM120 NVFP4 decode attention.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DS-V4 CSA sparse MLA decode using native C++ CuTe on SM120.
 
-    Packed caches are block-major: ``key_cache[P,Hkv,S,D/2]`` and
-    ``value_cache_transposed[P,Hkv,Dv,S/2]``, where ``S`` is 32, 64, or
-    128. ``block_table[B,max_blocks]`` and ``kv_lengths[B]`` are contiguous
-    CUDA int32 tensors. Each physical page/head owns an independent CUTLASS
-    SFB scale region.
+    Q/output: BF16 [B,64,512] or [B,1,64,512], already post-RoPE.
+    Both caches: FlashInfer NVFP4 uint8 [P,64,384] (4D HND/NHD also
+    accepted). Pages use a data region followed by a scale footer; the
+    apparent 384-byte tensor rows are NOT standalone encoded tokens.
+    Indices: int32 [B,K] or [B,1,K], flattened physical slots in each pool.
+    Optional int32 lengths[B] mask candidate-list suffixes. Negative and
+    out-of-range slots are masked; repeated slots count repeatedly.
+
+    Non-RoPE QK/PV use NVFP4, RoPE QK/PV use BF16, softmax/accumulation
+    use FP32. The 448-dimensional V is requantized along the gathered
+    candidate axis. Sink is optional FP32 [64], finite or -inf, added once
+    to the joint denominator. Output LSE is FP32 [B,64], base-2 by default;
+    set lse_scale=math.log(2) for natural-log LSE. Empty rows return zero
+    output and sink-only LSE (-inf without sink).
+
+    Caller performs selection, compression, RoPE and causal visibility.
+    All inputs must be finite except sink=-inf; buffers must not overlap.
+    No autograd support. This replaces the former dense/paged decode API.
     """
-    if softmax_scale is None:
-        logical_head_dim = int(query.shape[-1]) * 2
-        softmax_scale = logical_head_dim**-0.5
-    return torch.ops.sm120_nvfp4.attention_paged_decode(
-        query,
-        key_cache,
-        value_cache_transposed,
-        query_scale,
-        key_scale,
-        value_scale,
-        block_table,
-        kv_lengths,
-        softmax_scale,
-        output,
-        workspace,
+    return torch.ops.sm120_nvfp4.sparse_mla_decode(
+        query, swa_cache, compressed_cache, swa_indices, compressed_indices,
+        swa_lengths, compressed_lengths, sink, chunks_per_cta, softmax_scale,
+        lse_scale, output, lse, workspace,
     )
 
 
@@ -368,9 +320,8 @@ def scale_b_elements(m: int, n: int, k: int) -> int:
 
 
 __all__ = [
-    "attention_decode",
-    "attention_decode_workspace_bytes",
-    "attention_paged_decode",
+    "sparse_mla_decode",
+    "sparse_mla_decode_workspace_bytes",
     "attention_prefill",
     "attention_workspace_bytes",
     "expert_moe",
