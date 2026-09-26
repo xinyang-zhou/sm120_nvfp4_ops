@@ -61,7 +61,8 @@ target_link_libraries(
   sm120_nvfp4_grouped_gemm PUBLIC sm120_nvfp4_common CUDA::cudart)
 
 add_library(sm120_nvfp4_attention STATIC
-  src/attention/sparse_mla/decode.cu)
+  src/attention/sparse_mla/decode.cu
+  src/attention/sparse_mla/prefill.cu)
 sm120_nvfp4_configure_target(sm120_nvfp4_attention)
 target_link_libraries(
   sm120_nvfp4_attention PUBLIC sm120_nvfp4_gemm CUDA::cudart)

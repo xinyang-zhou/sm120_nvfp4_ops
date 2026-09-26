@@ -108,6 +108,50 @@ def sparse_mla_decode(
     )
 
 
+def sparse_mla_prefill(
+    query: torch.Tensor,
+    swa_cache: torch.Tensor,
+    compressed_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    compressed_indices: torch.Tensor,
+    *,
+    swa_lengths: Optional[torch.Tensor] = None,
+    compressed_lengths: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
+    softmax_scale: float = 512**-0.5,
+    lse_scale: float = 1.0,
+    output: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DS-V4 CSA fixed-index sparse prefill, one CTA/query, no workspace.
+
+    Q/output: contiguous BF16 [T,64,512], already post-RoPE, T>=1. Pack
+    queries from one or more requests into T rows. Both cache pools use
+    the same FlashInfer NVFP4 footer-scale ABI as sparse_mla_decode.
+    Indices must be int32 [T,Kswa] and [T,Kcompressed], with a separate
+    list for EVERY query. Optional int32 lengths[T] mask list suffixes.
+    Invalid slots, repeated IDs, empty candidates and sink follow decode.
+
+    The caller supplies causally valid indices and retains referenced cache
+    rows until the CUDA work completes. The core does not build a causal mask,
+    select Top-K, compress/append KV or infer request boundaries. Ragged or
+    query-chunked calls need only slice Q, indices and lengths consistently;
+    keep candidate order/capacity fixed to preserve quantization groups.
+
+    Non-RoPE QK/PV: NVFP4; RoPE: BF16; softmax states/accumulation: FP32.
+    All candidate chunks stay in one CTA, even for T<=64; sink is added
+    once, followed by final BF16 output. There is no split-output rounding
+    or global temporary storage. LSE is FP32 [T,64], base-2 * lse_scale.
+    Reuse output/lse to avoid device allocation, including CUDA Graph use.
+    Inputs and outputs must not overlap. No autograd support.
+    """
+    return torch.ops.sm120_nvfp4.sparse_mla_prefill(
+        query, swa_cache, compressed_cache, swa_indices, compressed_indices,
+        swa_lengths, compressed_lengths, sink, softmax_scale, lse_scale,
+        output, lse,
+    )
+
+
 def grouped_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -256,6 +300,7 @@ def scale_b_elements(m: int, n: int, k: int) -> int:
 
 
 __all__ = [
+    "sparse_mla_prefill",
     "sparse_mla_decode",
     "sparse_mla_decode_workspace_bytes",
     "expert_moe",

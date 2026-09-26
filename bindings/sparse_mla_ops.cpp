@@ -39,16 +39,18 @@ int pages(const torch::Tensor& cache, int device, const char* name) {
   return static_cast<int>(cache.size(0));
 }
 
+template <bool Prefill>
 int capacity(const torch::Tensor& indices, int device, int batch, const char* name) {
   check(indices, device, torch::kInt32, name);
-  TORCH_CHECK((indices.dim() == 2 || (indices.dim() == 3 && indices.size(1) == 1)) &&
+  TORCH_CHECK((indices.dim() == 2 || (!Prefill && indices.dim() == 3 && indices.size(1) == 1)) &&
                   indices.size(0) == batch,
-              name, " must have shape [B,K] or [B,1,K]");
+              name, Prefill ? " must have shape [T,K]" : " must have shape [B,K] or [B,1,K]");
   TORCH_CHECK(indices.size(-1) <= 1048576, name, " capacity exceeds 1048576");
   return static_cast<int>(indices.size(-1));
 }
 
-std::tuple<torch::Tensor, torch::Tensor> sparse_mla_decode_torch(
+template <bool Prefill>
+std::tuple<torch::Tensor, torch::Tensor> sparse_mla_torch(
     const torch::Tensor& query, const torch::Tensor& swa_cache,
     const torch::Tensor& compressed_cache, const torch::Tensor& swa_indices,
     const torch::Tensor& compressed_indices,
@@ -62,11 +64,12 @@ std::tuple<torch::Tensor, torch::Tensor> sparse_mla_decode_torch(
   int device = query.get_device();
   c10::cuda::CUDAGuard guard(device);
   check(query, device, torch::kBFloat16, "query");
-  TORCH_CHECK((query.dim() == 3 || (query.dim() == 4 && query.size(1) == 1)) &&
+  TORCH_CHECK((query.dim() == 3 || (!Prefill && query.dim() == 4 && query.size(1) == 1)) &&
                   query.size(-2) == 64 && query.size(-1) == 512,
-              "query must be BF16 [B,64,512] or [B,1,64,512]");
+              Prefill ? "query must be BF16 [T,64,512]" :
+                        "query must be BF16 [B,64,512] or [B,1,64,512]");
   TORCH_CHECK(query.size(0) > 0 && query.size(0) <= 1048576,
-              "batch must be in [1,1048576]");
+              Prefill ? "num_queries must be in [1,1048576]" : "batch must be in [1,1048576]");
   TORCH_CHECK(chunks_per_cta >= 0 && chunks_per_cta <= std::numeric_limits<int>::max(),
               "chunks_per_cta must be a nonnegative int32");
   TORCH_CHECK(std::isfinite(softmax_scale) && softmax_scale > 0 &&
@@ -81,8 +84,8 @@ std::tuple<torch::Tensor, torch::Tensor> sparse_mla_decode_torch(
   p.batch = static_cast<int>(query.size(0));
   p.swa_pages = pages(swa_cache, device, "swa_cache");
   p.compressed_pages = pages(compressed_cache, device, "compressed_cache");
-  p.swa_candidates = capacity(swa_indices, device, p.batch, "swa_indices");
-  p.compressed_candidates = capacity(compressed_indices, device, p.batch, "compressed_indices");
+  p.swa_candidates = capacity<Prefill>(swa_indices, device, p.batch, "swa_indices");
+  p.compressed_candidates = capacity<Prefill>(compressed_indices, device, p.batch, "compressed_indices");
   p.query = reinterpret_cast<const __nv_bfloat16*>(query.const_data_ptr<at::BFloat16>());
   p.swa_cache = swa_cache.const_data_ptr<std::uint8_t>();
   p.compressed_cache = compressed_cache.const_data_ptr<std::uint8_t>();
@@ -92,7 +95,8 @@ std::tuple<torch::Tensor, torch::Tensor> sparse_mla_decode_torch(
   auto lengths = [&](const std::optional<torch::Tensor>& t, const char* name) -> const int* {
     if (!t) return nullptr;
     check(*t, device, torch::kInt32, name);
-    TORCH_CHECK(t->dim() == 1 && t->size(0) == p.batch, name, " must have shape [B]");
+    TORCH_CHECK(t->dim() == 1 && t->size(0) == p.batch, name,
+                Prefill ? " must have shape [T]" : " must have shape [B]");
     inputs.push_back(*t);
     return t->const_data_ptr<int>();
   };
@@ -113,14 +117,20 @@ std::tuple<torch::Tensor, torch::Tensor> sparse_mla_decode_torch(
   TORCH_CHECK(result.sizes() == query.sizes(), "output must have query's shape");
   torch::Tensor result_lse = lse ? *lse : torch::empty({p.batch, 64}, query.options().dtype(torch::kFloat32));
   check(result_lse, device, torch::kFloat32, "lse");
-  TORCH_CHECK(result_lse.sizes() == torch::IntArrayRef({p.batch, 64}), "lse must have shape [B,64]");
-  std::size_t required = sm120_nvfp4::sparse_mla_decode_workspace_size(
-      p.batch, p.swa_candidates, p.compressed_candidates, p.chunks_per_cta);
-  torch::Tensor scratch = workspace ? *workspace : torch::empty(
-      {static_cast<std::int64_t>(required)}, query.options().dtype(torch::kUInt8));
-  check(scratch, device, torch::kUInt8, "workspace");
-  TORCH_CHECK(static_cast<std::size_t>(scratch.numel()) >= required, "workspace needs ", required, " bytes");
-  std::vector<torch::Tensor> writes{result, result_lse, scratch};
+  TORCH_CHECK(result_lse.sizes() == torch::IntArrayRef({p.batch, 64}),
+              Prefill ? "lse must have shape [T,64]" : "lse must have shape [B,64]");
+  std::size_t required = 0;
+  torch::Tensor scratch;
+  std::vector<torch::Tensor> writes{result, result_lse};
+  if constexpr (!Prefill) {
+    required = sm120_nvfp4::sparse_mla_decode_workspace_size(
+        p.batch, p.swa_candidates, p.compressed_candidates, p.chunks_per_cta);
+    scratch = workspace ? *workspace : torch::empty(
+        {static_cast<std::int64_t>(required)}, query.options().dtype(torch::kUInt8));
+    check(scratch, device, torch::kUInt8, "workspace");
+    TORCH_CHECK(static_cast<std::size_t>(scratch.numel()) >= required, "workspace needs ", required, " bytes");
+    writes.push_back(scratch);
+  }
   for (std::size_t i = 0; i < writes.size(); ++i) {
     for (const auto& input : inputs)
       TORCH_CHECK(!overlaps(writes[i], input), "output/lse/workspace must not overlap inputs");
@@ -129,12 +139,33 @@ std::tuple<torch::Tensor, torch::Tensor> sparse_mla_decode_torch(
   }
   p.output = reinterpret_cast<__nv_bfloat16*>(result.mutable_data_ptr<at::BFloat16>());
   p.lse = result_lse.mutable_data_ptr<float>();
-  auto status = sm120_nvfp4::sparse_mla_decode_sm120(
-      p, scratch.mutable_data_ptr(), required, at::cuda::getCurrentCUDAStream(device).stream());
+  auto stream = at::cuda::getCurrentCUDAStream(device).stream();
+  sm120_nvfp4::GemmStatus status;
+  if constexpr (Prefill) {
+    sm120_nvfp4::SparseMlaPrefillParams prefill;
+    static_cast<sm120_nvfp4::SparseMlaCommonParams&>(prefill) = p;
+    prefill.num_queries = p.batch;
+    status = sm120_nvfp4::sparse_mla_prefill_sm120(prefill, stream);
+  } else {
+    status = sm120_nvfp4::sparse_mla_decode_sm120(p, scratch.mutable_data_ptr(), required, stream);
+  }
   TORCH_CHECK(status == sm120_nvfp4::GemmStatus::kSuccess, "SM120 sparse MLA failed: ",
               sm120_nvfp4::gemm_status_string(status));
   C10_CUDA_CHECK(cudaGetLastError());
   return {result, result_lse};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> sparse_mla_prefill_torch(
+    const torch::Tensor& query, const torch::Tensor& swa_cache,
+    const torch::Tensor& compressed_cache, const torch::Tensor& swa_indices,
+    const torch::Tensor& compressed_indices,
+    std::optional<torch::Tensor> swa_lengths,
+    std::optional<torch::Tensor> compressed_lengths,
+    std::optional<torch::Tensor> sink, double softmax_scale, double lse_scale,
+    std::optional<torch::Tensor> output, std::optional<torch::Tensor> lse) {
+  return sparse_mla_torch<true>(query, swa_cache, compressed_cache, swa_indices,
+      compressed_indices, swa_lengths, compressed_lengths, sink, 0,
+      softmax_scale, lse_scale, output, lse, std::nullopt);
 }
 
 }  // namespace
@@ -145,5 +176,10 @@ TORCH_LIBRARY_FRAGMENT(sm120_nvfp4, m) {
         "Tensor? compressed_lengths, Tensor? sink, int chunks_per_cta, "
         "float softmax_scale, float lse_scale, Tensor(a!)? output, Tensor(b!)? lse, "
         "Tensor(c!)? workspace) -> (Tensor(a!), Tensor(b!))");
-  m.impl("sparse_mla_decode", torch::kCUDA, &sparse_mla_decode_torch);
+  m.impl("sparse_mla_decode", torch::kCUDA, &sparse_mla_torch<false>);
+  m.def("sparse_mla_prefill(Tensor query, Tensor swa_cache, Tensor compressed_cache, "
+        "Tensor swa_indices, Tensor compressed_indices, Tensor? swa_lengths, "
+        "Tensor? compressed_lengths, Tensor? sink, float softmax_scale, "
+        "float lse_scale, Tensor(a!)? output, Tensor(b!)? lse) -> (Tensor(a!), Tensor(b!))");
+  m.impl("sparse_mla_prefill", torch::kCUDA, &sparse_mla_prefill_torch);
 }

@@ -125,11 +125,14 @@ Before Custom CuTe was added, `nvfp4_gemm_sm120` referred to the CUTLASS Collect
 
 Consequently, the historical M=512 result means “configured CUTLASS Collective exceeded the selected cuBLASLt heuristic on this shape,” not “the repository-owned Custom CuTe kernel exceeded cuBLASLt.”
 
-## DS-V4 CSA sparse MLA decode
+## DS-V4 CSA sparse MLA decode and prefill
 
 The new C++ CuTe sparse MLA kernel has not yet been compiled, tested or
 benchmarked on the GPU server. See [Sparse MLA](SPARSE_MLA.md) for its
 numerical reference, validation gates and reproducible FlashInfer A/B commands.
+The current benchmark script measures decode. Prefill reuses the same CuTe
+loop with one CTA/query and zero workspace; its throughput and occupancy
+remain unmeasured.
 
 ## Generated instruction verification
 

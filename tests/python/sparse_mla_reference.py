@@ -168,3 +168,29 @@ def make_problem(batch=2, swa=128, compressed=512, seed=43, device="cuda"):
     ids1 = torch.randint(swa_pages * 64, (batch, swa), generator=generator, device=device, dtype=torch.int32)
     ids2 = torch.randint(comp_pages * 64, (batch, compressed), generator=generator, device=device, dtype=torch.int32)
     return query, cache1, cache2, ids1, ids2
+
+
+def prefill_reference(query, swa_cache, compressed_cache, swa_indices,
+                      compressed_indices, **kwargs):
+    """The same quantized matrix reference with one complete stream/query."""
+    chunks = max(1, math.ceil(swa_indices.shape[-1] / 64) +
+                 math.ceil(compressed_indices.shape[-1] / 64))
+    return reference(query, swa_cache, compressed_cache, swa_indices,
+                     compressed_indices, chunks_per_cta=chunks, **kwargs)
+
+
+def make_prefill_problem(queries=7, swa=128, compressed=512, seed=91, device="cuda"):
+    """Independent query rows sharing two pools; selection is synthetic.
+
+    This is a fixed-index core fixture, not a CSA compressor/indexer model.
+    Cache allocation is independent of the number of query rows.
+    """
+    _, cache1, cache2, _, _ = make_problem(1, swa, compressed, seed, device)
+    generator = torch.Generator(device=device).manual_seed(seed + 1)
+    query = (torch.randn((queries, 64, 512), generator=generator, device=device) * .25)
+    query *= torch.linspace(.25, 2., 32, device=device).repeat_interleave(16)
+    ids1 = torch.randint(cache1.shape[0] * 64, (queries, swa),
+                         generator=generator, device=device, dtype=torch.int32)
+    ids2 = torch.randint(cache2.shape[0] * 64, (queries, compressed),
+                         generator=generator, device=device, dtype=torch.int32)
+    return query.to(torch.bfloat16), cache1, cache2, ids1, ids2

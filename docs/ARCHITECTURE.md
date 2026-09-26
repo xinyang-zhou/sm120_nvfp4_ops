@@ -114,7 +114,7 @@ The single kernel specializes scheduling for one matrix. Grouped GEMM adds runti
 
 ## Attention
 
-### DS-V4 CSA sparse decode
+### DS-V4 CSA sparse decode and prefill
 
 The former dense prefill and dense/paged decode implementations have been
 removed. The DS-V4 sparse MLA implementation
@@ -124,6 +124,14 @@ One CTA handles all 64 query heads and a range of 64-candidate chunks from
 SWA and compressed shared-KV caches. Raw KV is asynchronously double buffered;
 V is requantized along the gathered candidate axis inside the CTA. Split
 outputs are BF16, LSE is FP32, and the sink enters the final denominator once.
+Prefill packs independent query rows into `[T,64,512]` and gives each row its
+own SWA/compressed index lists and optional valid lengths. The C++ prefill
+entry point forces all candidate chunks into one CTA/query, reusing the same
+`attention_kernel` and CuTe atoms as decode with no merge or global scratch.
+Selection, causal visibility, request isolation and cache updates are supplied
+by the caller. Query rows can be sliced into separate launches without changing
+their candidate grouping or numerical path; this does not implement compressor
+state management for chunked prefill.
 See [Sparse MLA](SPARSE_MLA.md) for the source/math mapping and validation
 status. The new kernel has not yet been compiled or tested on the server.
 
@@ -202,7 +210,7 @@ Uniform tests can fill the physical allocation with one UE4M3 byte. Non-uniform 
 - `src/gemm/`: default dispatcher, generic/specialized Custom CuTe kernels,
   and isolated CUTLASS reference;
 - `src/grouped_gemm/`: dynamic expert scheduling and compute kernel;
-- `src/attention/`: DS-V4 CSA sparse MLA decode;
+- `src/attention/`: DS-V4 CSA sparse MLA decode and fixed-index prefill;
 - `bindings/`: validation, allocation and PyTorch registration;
 - `tests/`: correctness and adversarial routing/layout cases;
 - `benchmarks/`: performance comparisons, never imported by the library.

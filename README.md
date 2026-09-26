@@ -1,6 +1,6 @@
 # SM120 NVFP4 Operator Stack
 
-面向 NVIDIA SM120（GeForce RTX 50 系列）的 NVFP4 算子库，覆盖自定义矩阵乘、DS-V4 CSA sparse MLA decode 和端到端 Mixture-of-Experts：
+面向 NVIDIA SM120（GeForce RTX 50 系列）的 NVFP4 算子库，覆盖自定义矩阵乘、DS-V4 CSA sparse MLA decode/prefill 和端到端 Mixture-of-Experts：
 
 ```text
 Custom CuTe NVFP4 GEMM
@@ -12,9 +12,9 @@ Custom CuTe NVFP4 GEMM
 
 单 GEMM 与 Grouped GEMM 都由仓库自有的 `__global__` kernel 实现，直接使用 CuTe tensor/partition/copy/gemm abstraction 组织 TMA、shared-memory pipeline 和 SM120 block-scaled MMA。CUTLASS `GemmUniversalAdapter` 版本仅作为 reference 保留，不是默认执行路径。
 
-GEMM 使用 packed E2M1、UE4M3 scale、FP32 累加和 FP16 输出。新 sparse MLA decode 使用 BF16 Q/O，448 维 NVFP4 与 64 维 BF16 混合计算。
+GEMM 使用 packed E2M1、UE4M3 scale、FP32 累加和 FP16 输出。新 sparse MLA decode/prefill 使用 BF16 Q/O，448 维 NVFP4 与 64 维 BF16 混合计算。
 
-> 项目处于 research preview 阶段。既有 GEMM 等路径有 RTX 5090 实测；新 DS-V4 sparse MLA decode 仅完成本地源码开发，构建、正确性和性能待服务器验证，见 [Sparse MLA](docs/SPARSE_MLA.md)。
+> 项目处于 research preview 阶段。既有 GEMM 等路径有 RTX 5090 实测；新 DS-V4 sparse MLA decode/prefill 仅完成本地源码开发，构建、正确性和性能待服务器验证，见 [Sparse MLA](docs/SPARSE_MLA.md)。
 
 ## Highlights
 
@@ -24,6 +24,7 @@ GEMM 使用 packed E2M1、UE4M3 scale、FP32 累加和 FP16 输出。新 sparse 
 - FP16 epilogue 对不少于 64 行的问题使用 shared-memory staging 与 TMA store，小 M 保留低开销 predicated store；
 - 使用 `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X` 原生 block-scaled Tensor Core 指令；
 - 新 C++ CuTe sparse MLA decode 支持 DS-V4 的 64-head shared-KV、SWA＋Top-K 双缓存、混合精度 QK/PV、FP32 分母、sink 和 split 合并；原 dense prefill/decode 与 paged decode 已移除；
+- sparse prefill 接收每个 query 独立的合法索引，一个 CTA 完整处理一行 Q，复用 decode 数学与精度规则，无 split workspace；
 - 保留 CUTLASS Collective reference，并提供 Custom CuTe、CUTLASS、cuBLASLt 三方性能与正确性对照；
 - Grouped GEMM 在一次 persistent launch 中调度多个动态 M expert；
 - Fused MoE 包含路由重排、两次 Grouped GEMM、SiLU、动态 NVFP4 量化和 top-k reduce；
@@ -47,7 +48,7 @@ sm120_nvfp4_ops/
 │   │   ├── specialized/        # M=128 / M=256 固定 Split-K 路径
 │   │   └── cutlass_reference.cu
 │   ├── grouped_gemm/          # persistent expert GEMM
-│   ├── attention/             # DS-V4 CSA sparse MLA decode
+│   ├── attention/             # DS-V4 CSA sparse MLA decode/prefill
 │   └── fused_moe/             # gather/activation/reduce 与 orchestration
 ├── bindings/                  # PyTorch custom-op registration
 ├── python/sm120_nvfp4/        # Python 友好接口
@@ -130,6 +131,7 @@ cmake -S . -B build \
 
 - Custom CuTe 单 GEMM CPU reference；
 - sparse MLA 的混合精度参考、稀疏索引、双缓存、sink、split、buffer 复用及 CUDA Graph（待服务器运行）；
+- sparse prefill 的逐 query 候选、ragged query 行、分块调用一致性、FlashInfer streaming prefill 对照（待服务器运行）；
 - Custom CuTe、默认 `gemm` 与 CUTLASS reference 一致性；
 - Grouped GEMM 不均匀 expert row count；
 - Fused MoE 本地/远端路由和非均匀 activation scale；
@@ -163,6 +165,17 @@ decode_output, lse2 = sm120_nvfp4.sparse_mla_decode(
     swa_indices,             # int32 [B,128]，物理 slot IDs
     compressed_indices,      # int32 [B,512]
     sink=attention_sink,     # 可选 FP32 [64]
+)
+
+# Prefill：T 是本轮所有请求的 query 总数，每行独立提供候选。
+prefill_output, prefill_lse2 = sm120_nvfp4.sparse_mla_prefill(
+    prefill_query_bf16,      # [T,64,512]，已完成 RoPE
+    swa_cache, compressed_cache,
+    prefill_swa_indices,     # int32 [T,Kswa]
+    prefill_comp_indices,    # int32 [T,Kcompressed]
+    swa_lengths=prefill_swa_lengths,             # 可选 int32 [T]
+    compressed_lengths=prefill_comp_lengths,     # 可选 int32 [T]
+    sink=attention_sink,
 )
 
 y_grouped = sm120_nvfp4.grouped_gemm(
@@ -255,8 +268,9 @@ NVLink/RDMA Kernel 性能；详细定义和原始数据见
 ## Current limitations and roadmap
 
 - 仅支持 `compute_120a/sm_120a`；
-- sparse decode 固定 DS-V4 `Hq=64,Hkv=1,D=448+64`、64-token 页；支持双缓存稀疏候选、长度、sink、split，尚不包含 compressor/indexer 或完整 attention block；
-- sparse decode 的构建、数值、竞争检查和性能均待服务器验证；
+- sparse MLA 固定 DS-V4 `Hq=64,Hkv=1,D=448+64`、64-token 页；decode 支持 split，prefill 固定每 query 一个 CTA；尚不包含 compressor/indexer 或完整 attention block；
+- prefill 要求调用方提供每个 query 的合法索引并维持缓存生命周期，支持按 query 切分调用，尚未实现 chunked prefill 的压缩缓存状态管理；
+- sparse decode/prefill 的构建、数值、竞争检查和性能均待服务器验证；
 - Custom CuTe 当前只有 `128 x 128 x 128`、3-stage 配置；
 - 默认 GEMM 已完成 M=128/M=256 专用路径和其他 M 的通用回退；两条专用路径需要由 workspace query 返回的 FP32 临时空间；
 - Custom CuTe 的 FP32-output 路径及 `M < 64` 的 FP16 路径仍使用线程直接写回；其余 FP16 tile 使用 TMA store；

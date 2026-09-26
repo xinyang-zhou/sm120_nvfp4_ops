@@ -107,11 +107,26 @@ torch.ops.sm120_nvfp4.cute_gemm
 torch.ops.sm120_nvfp4.cutlass_gemm
 ```
 
-## DS-V4 CSA sparse MLA decode
+## DS-V4 CSA sparse MLA decode and prefill
 
 The legacy dense prefill and dense/paged decode APIs have been removed.
 Use `sparse_mla_decode` with BF16 query/output, shared-latent NVFP4 caches
 and explicit SWA/compressed physical slot lists.
+
+`sparse_mla_prefill` takes BF16 `query[T,64,512]`, the same packed cache pools,
+and independent int32 `swa_indices[T,Kswa]` / `compressed_indices[T,Kcompressed]`.
+Optional arguments are `swa_lengths[T]`, `compressed_lengths[T]`, `sink[64]`,
+`softmax_scale`, `lse_scale`, reusable BF16 `output[T,64,512]` and FP32
+`lse[T,64]`. It returns `(output, lse)` and has no workspace or split setting.
+One CTA processes all candidate chunks for each query. T must be positive;
+causality, request isolation and cache lifetime are the caller's responsibility.
+Prefill preserves the same precision contract as direct-output decode.
+
+C++ uses `SparseMlaDecodeParams` / `sparse_mla_decode_sm120` and
+`SparseMlaPrefillParams` / `sparse_mla_prefill_sm120`. Both parameter types
+inherit common fields from `SparseMlaCommonParams`; rebuild callers when
+updating the header. The registered prefill op is
+`torch.ops.sm120_nvfp4.sparse_mla_prefill`.
 
 See [Sparse MLA](SPARSE_MLA.md) for cache ABI, precision, masking, workspace,
 examples and server validation. C++ declarations are in

@@ -129,7 +129,7 @@ __device__ __forceinline__ float exponent(float lse, float maximum) {
 }
 
 __global__ __launch_bounds__(kThreads, 1)
-void decode_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
+void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
                    int splits, __nv_bfloat16* partial, float* partial_lse) {
   extern __shared__ __align__(16) unsigned char shared[];
   auto& sm = *reinterpret_cast<SharedStorage*>(shared);
@@ -399,13 +399,13 @@ GemmStatus sparse_mla_decode_sm120(const SparseMlaDecodeParams& p,
   if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&properties, device) != cudaSuccess)
     return GemmStatus::kCudaError;
   if (properties.major != 12 || properties.minor != 0) return GemmStatus::kUnsupportedDevice;
-  if (cudaFuncSetAttribute(sparse_mla::decode_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  if (cudaFuncSetAttribute(sparse_mla::attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            sizeof(sparse_mla::SharedStorage)) != cudaSuccess) return GemmStatus::kCudaError;
   auto* partial = static_cast<__nv_bfloat16*>(workspace);
   float* partial_lse = splits > 1 ? reinterpret_cast<float*>(
       partial + static_cast<std::size_t>(p.batch) * 64 * splits * 512) : nullptr;
   int chunks = (p.swa_candidates + 63) / 64 + (p.compressed_candidates + 63) / 64;
-  sparse_mla::decode_kernel<<<dim3(p.batch, splits), 256, sizeof(sparse_mla::SharedStorage), stream>>>(
+  sparse_mla::attention_kernel<<<dim3(p.batch, splits), 256, sizeof(sparse_mla::SharedStorage), stream>>>(
       p, cpb, chunks, splits, partial, partial_lse);
   if (cudaPeekAtLastError() != cudaSuccess) return GemmStatus::kCudaError;
   if (splits > 1) {
