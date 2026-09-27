@@ -16,6 +16,7 @@ namespace sm120_nvfp4::sparse_mla {
 
 constexpr int kHeads = 64, kDim = 512, kNope = 448, kRope = 64;
 constexpr int kCandidates = 64, kWarps = 8, kThreads = 256;
+constexpr int kStages = 2;
 constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kEmpty = -1.0e30f;
 
@@ -28,7 +29,7 @@ struct alignas(16) RawTile {
 struct alignas(16) SharedStorage {
   std::uint8_t q[64][224];
   std::uint8_t qs[64][28];
-  RawTile raw[2];
+  RawTile raw[kStages];
   std::uint8_t vt[448][32];
   std::uint8_t vts[448][4];
   __nv_bfloat16 weight[64][64];
@@ -141,15 +142,19 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
   // tile for all 64 heads. These FP32 accumulators live across all chunks.
   float output[4][7][4] = {};
   float rope_output[4][4] = {};
-  if (begin < end) prefetch(p, sm.raw[0], batch, begin);
+  // Two raw-KV stages: prefetch the next chunk while consuming the current
+  // one. Async-copy waits and CTA barriers synchronize stage reuse without
+  // tracking a barrier phase.
+  int read_stage = 0;
+  int write_stage = 1;
+  if (begin < end) prefetch(p, sm.raw[read_stage], batch, begin);
   __pipeline_wait_prior(0);
   __syncthreads();
 
   for (int chunk = begin; chunk < end; ++chunk) {
-    int buffer = (chunk - begin) & 1;
-    const RawTile& raw = sm.raw[buffer];
+    const RawTile& raw = sm.raw[read_stage];
     // Next raw tile can arrive while CuTe MMA/softmax/PV consume this one.
-    if (chunk + 1 < end) prefetch(p, sm.raw[buffer ^ 1], batch, chunk + 1);
+    if (chunk + 1 < end) prefetch(p, sm.raw[write_stage], batch, chunk + 1);
 
     float scores[4][4] = {};
 #pragma unroll
@@ -265,10 +270,15 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
 #pragma unroll
       for (int i = 0; i < 4; ++i) rope_output[g][i] += contribution[i];
     }
-    // Every current-buffer reader and asynchronous next-buffer writer has
-    // finished before either raw buffer can be consumed/recycled.
+    // Every read-stage reader and asynchronous write-stage writer has
+    // finished before either raw stage can be consumed/recycled.
     __pipeline_wait_prior(0);
     __syncthreads();
+
+    ++read_stage;
+    if (read_stage == kStages) read_stage = 0;
+    ++write_stage;
+    if (write_stage == kStages) write_stage = 0;
   }
 
   if (tid < 64) {
