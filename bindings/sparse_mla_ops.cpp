@@ -168,6 +168,29 @@ std::tuple<torch::Tensor, torch::Tensor> sparse_mla_prefill_torch(
       softmax_scale, lse_scale, output, lse, std::nullopt);
 }
 
+torch::Tensor sparse_mla_pack_cache_torch(const torch::Tensor& values,
+    const torch::Tensor& slots, torch::Tensor cache) {
+  TORCH_CHECK(values.is_cuda(), "values must be a CUDA tensor");
+  int device = values.get_device();
+  c10::cuda::CUDAGuard guard(device);
+  check(values, device, torch::kBFloat16, "values");
+  check(slots, device, torch::kInt32, "slots");
+  TORCH_CHECK(values.dim() == 2 && values.size(1) == 512 && values.size(0) <= 1048576,
+              "values must have shape [N,512], N<=1048576");
+  TORCH_CHECK(slots.dim() == 1 && slots.size(0) == values.size(0), "slots must have shape [N]");
+  int count = pages(cache, device, "cache");
+  TORCH_CHECK(!overlaps(values, cache) && !overlaps(slots, cache), "cache must not overlap inputs");
+  auto status = sm120_nvfp4::sparse_mla_pack_cache_sm120(
+      static_cast<int>(values.size(0)),
+      reinterpret_cast<const __nv_bfloat16*>(values.const_data_ptr<at::BFloat16>()),
+      slots.const_data_ptr<int>(), cache.mutable_data_ptr<std::uint8_t>(), count,
+      at::cuda::getCurrentCUDAStream(device).stream());
+  TORCH_CHECK(status == sm120_nvfp4::GemmStatus::kSuccess, "SM120 cache append failed: ",
+              sm120_nvfp4::gemm_status_string(status));
+  C10_CUDA_CHECK(cudaGetLastError());
+  return cache;
+}
+
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(sm120_nvfp4, m) {
@@ -182,4 +205,6 @@ TORCH_LIBRARY_FRAGMENT(sm120_nvfp4, m) {
         "Tensor? compressed_lengths, Tensor? sink, float softmax_scale, "
         "float lse_scale, Tensor(a!)? output, Tensor(b!)? lse) -> (Tensor(a!), Tensor(b!))");
   m.impl("sparse_mla_prefill", torch::kCUDA, &sparse_mla_prefill_torch);
+  m.def("sparse_mla_pack_cache(Tensor values, Tensor slots, Tensor(a!) cache) -> Tensor(a!)");
+  m.impl("sparse_mla_pack_cache", torch::kCUDA, &sparse_mla_pack_cache_torch);
 }

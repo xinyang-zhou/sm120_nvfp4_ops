@@ -17,6 +17,9 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
 ]
 
+[project.optional-dependencies]
+dsv4 = ["safetensors"]
+
 [tool.scikit-build]
 cmake.args = ["-DSM120_NVFP4_BUILD_TORCH=ON"]
 wheel.packages = ["python/sm120_nvfp4"]

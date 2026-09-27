@@ -49,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--eager", action="store_true",
                         help="Time public API calls with CUDA events instead of graph replay.")
+    parser.add_argument("--profile-once", action="store_true",
+                        help="Bracket one warmed attention call with CUDA Profiler start/stop.")
     parser.add_argument("--l2-flush-mib", type=int, default=256,
                         help="Zero this buffer before each timed call, outside timing; 0 disables it.")
     parser.add_argument("--output", type=Path,
@@ -66,6 +68,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("l2-flush-mib must be nonnegative")
     if args.output and args.output.exists():
         parser.error("output already exists; choose a new result filename")
+    if args.profile_once and (len(args.batches) != 1 or args.output is not None):
+        parser.error("profile-once requires exactly one batch and no benchmark JSON output")
     return args
 
 
@@ -220,6 +224,39 @@ def measure(run, args: argparse.Namespace) -> tuple[list[list[float]], torch.Ten
     return samples, eager_output
 
 
+def profile_once(run, args: argparse.Namespace) -> torch.Tensor:
+    """Capture one core invocation; setup, reference checks and L2 flush stay outside."""
+    for _ in range(args.warmup):
+        run()
+    torch.cuda.synchronize()
+    eager_output = run().clone()
+    if args.eager:
+        execute = run
+    else:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        execute = graph.replay
+    for _ in range(args.warmup):
+        execute()
+    if args.l2_flush_mib:
+        flush = torch.empty(args.l2_flush_mib << 20, dtype=torch.uint8, device="cuda")
+        flush.zero_()
+    torch.cuda.synchronize()
+
+    # Nsight Compute: --profile-from-start off; Systems: --capture-range=cudaProfilerApi.
+    # A single public call may launch both the main attention and a merge kernel.
+    cudart = torch.cuda.cudart()
+    torch.cuda.check_error(cudart.cudaProfilerStart())
+    try:
+        with torch.cuda.nvtx.range("sparse_attention_core"):
+            execute()
+            torch.cuda.synchronize()
+    finally:
+        torch.cuda.check_error(cudart.cudaProfilerStop())
+    return eager_output
+
+
 def percentile(samples: list[float], quantile: float) -> float:
     ordered = sorted(samples)
     position = (len(ordered) - 1) * quantile
@@ -298,14 +335,23 @@ def run_case(args: argparse.Namespace, batch: int) -> dict:
     del local_comp, local_swa, offset
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-    samples, eager_output = measure(run, args)
+    if args.profile_once:
+        print(f"PROFILE B={batch}  {plan['implementation']}  cpb={plan['cpb']}  "
+              "one core invocation including any merge", flush=True)
+        eager_output = profile_once(run, args)
+    else:
+        samples, eager_output = measure(run, args)
     if not torch.isfinite(output).all().item():
-        raise RuntimeError(f"B={batch}: timed output contains NaN/Inf")
+        raise RuntimeError(f"B={batch}: executed output contains NaN/Inf")
     torch.testing.assert_close(output, eager_output, rtol=0, atol=0)
     final_plan = inspect_public_plan(q, swa_cache, swa_ids, output, swa_lengths, sink,
                                      comp_cache, comp_ids, comp_lengths)
     if final_plan != plan:
-        raise RuntimeError("Planner changed during measurement; rerun after calibration settles")
+        raise RuntimeError("Planner changed during execution; rerun after calibration settles")
+    if args.profile_once:
+        print("Profile invocation complete; output matches eager and plan is unchanged.",
+              flush=True)
+        return {"batch": batch, "plan": plan, "profiled_core_invocations": 1}
     flattened = [value for run_samples in samples for value in run_samples]
     p50 = statistics.median(flattened)
     memory = {
@@ -344,6 +390,14 @@ def main() -> None:
     args = parse_args()
     torch.cuda.set_device(0)
     info = environment()
+    if args.profile_once:
+        execution = "eager core call" if args.eager else "CUDA Graph replay"
+        print(f"GPU={info['gpu']}  FlashInfer={info['flashinfer_commit'][:12]}  "
+              f"history={args.context_length}  B={args.batches}", flush=True)
+        print(f"Profile only; one {execution}; cache disturbance={args.l2_flush_mib} MiB "
+              "before capture; no benchmark latency samples.", flush=True)
+        run_case(args, args.batches[0])
+        return
     report = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "environment": info,

@@ -16,6 +16,11 @@ GEMM 使用 packed E2M1、UE4M3 scale、FP32 累加和 FP16 输出。新 sparse 
 
 > 项目处于 research preview 阶段。既有 GEMM 等路径有 RTX 5090 实测；新 DS-V4 sparse MLA decode/prefill 仅完成本地源码开发，构建、正确性和性能待服务器验证，见 [Sparse MLA](docs/SPARSE_MLA.md)。
 
+当前交付范围（2026-09-27）：**目标 kernel、正确性测试与算子 benchmark**，
+后续对接 SGLang DS-V4 后端。独立完整 block/Transformer 运行时不作为前置交付。
+本轮增加 CSA/HCA core、cache pack/append、单 GPU MoE 的验证/计时入口；
+服务器命令、计时边界和验收状态见 [算子里程碑](docs/OPERATOR_MILESTONE.md)。
+
 ## Highlights
 
 - 仓库自有 Custom CuTe 单 GEMM，不调用 CUTLASS `GemmUniversal` 或 `GemmUniversalAdapter`；
@@ -241,7 +246,7 @@ E2M1 数据与 UE4M3 scale，并逐元素验证。
 的 TMA-store epilogue 将 Custom CuTe 从修改前的 35.0 us 降至 28.4 us。
 完整测量方法、证据状态和历史 CUTLASS sweep 见
 [Performance](docs/PERFORMANCE.md)。在新的结构化结果重新采集并入库前，
-这些历史手工记录数字不应直接作为简历中的可追溯结果。
+这些历史手工记录数字暂不作为可追溯的性能证据。
 
 默认 dispatcher 在相同目标 shape 上相对显式通用 CuTe 的最终结果：
 
@@ -297,6 +302,7 @@ GEMM 阶段收尾状态：
 
 ## Documentation
 
+- [算子正确性与 benchmark 里程碑](docs/OPERATOR_MILESTONE.md)
 - [DS-V4 CSA Sparse MLA](docs/SPARSE_MLA.md)
 
 - [Architecture](docs/ARCHITECTURE.md)

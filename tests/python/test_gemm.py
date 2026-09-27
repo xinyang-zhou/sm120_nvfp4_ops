@@ -14,6 +14,28 @@ def require_sm120() -> None:
 
 
 class GemmTest(unittest.TestCase):
+    def test_signed_payloads_across_default_dispatch(self) -> None:
+        require_sm120()
+        torch.manual_seed(920)
+        n, k = 256, 512
+        levels = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.,
+                               -0., -.5, -1., -1.5, -2., -3., -4., -6.], device="cuda")
+
+        def decode(packed):
+            return levels[torch.stack((packed & 15, packed >> 4), -1).flatten(-2).long()]
+
+        for m in (7, 128, 256):
+            with self.subTest(m=m):
+                a = torch.randint(256, (m, k // 2), dtype=torch.uint8, device="cuda")
+                b = torch.randint(256, (n, k // 2), dtype=torch.uint8, device="cuda")
+                sfa = torch.full((sm120_nvfp4.scale_a_elements(m, n, k),), 0x18,
+                                 device="cuda", dtype=torch.uint8)
+                sfb = torch.full((sm120_nvfp4.scale_b_elements(m, n, k),), 0x20,
+                                 device="cuda", dtype=torch.uint8)
+                expected = ((decode(a) * .0625) @ (decode(b) * .125).T).half()
+                actual = sm120_nvfp4.gemm(a, b, sfa, sfb)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_cute_matches_cutlass_reference(self) -> None:
         require_sm120()
         m, n, k = 16, 128, 128

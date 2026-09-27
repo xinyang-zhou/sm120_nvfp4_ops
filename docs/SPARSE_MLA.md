@@ -5,8 +5,8 @@ locally**. Server validation is required. The former dense prefill and
 dense/paged decode APIs, kernels and tests have been removed. Sparse MLA is
 the repository's attention implementation.
 
-The numerical design is recorded in [attention_decode_math.tex](attention_decode_math.tex),
-a snapshot of `/home/xinyang/attention.tex`. This implements the attention core:
+The numerical design is recorded in [attention_decode_math.tex](attention_decode_math.tex).
+This implements the attention core:
 the caller supplies post-RoPE Q, packed shared-latent KV pools and selected
 physical slot IDs. Compression, indexer/Top-K selection, cache append, causal
 selection and output projection remain outside this operator.
@@ -119,6 +119,23 @@ row has 224 packed FP4 bytes followed by 128 BF16 RoPE bytes. The remaining
 `64*32` bytes hold the scale footer: 28 E4M3 bytes plus four padding bytes per
 token. **Do not interpret the tensor's apparent 384-byte rows as token records.**
 The format accepts FlashInfer's `nvfp4_quantize_pack_sparse_mla_cache` output.
+
+### Standalone cache packing / append
+
+`sparse_mla_pack_cache(values, slots, cache)` accepts BF16 `[N,512]`, CUDA
+int32 physical slots `[N]`, and a preallocated footer-scale cache. It uses the
+same native `quantize16` as attention, writes only the addressed rows, and
+preserves the 64 BF16 RoPE values exactly. Sequential slots implement packing;
+arbitrary slots implement append. Valid destination slots must be unique in
+one call; invalid slots are ignored and N=0 is a no-op. The caller owns
+allocation and orders reads/writes on the CUDA stream. Reusable buffers support
+CUDA Graph replay with changed values/slot contents.
+
+Standalone byte-level tests and decode/prefill/cache benchmarks are described
+in [Operator milestone](OPERATOR_MILESTONE.md). They do not require the Python
+stateful block, model checkpoint, or compressor. The same fixed-index core is
+also exercised with all visible HCA compressed entries (ratio=128 fixtures);
+this does not implement an HCA compressor or specialized contiguous-read kernel.
 
 An index `i` selects physical page `i//64`, row `i%64` in its own pool. SWA
 chunks come before compressed-cache chunks; each list is padded independently

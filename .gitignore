@@ -13,3 +13,15 @@ __pycache__/
 /gemm_m*.json
 /README_LEARNING_HANDOFF.md
 /README_OPERATOR_ROADMAP.md
+/third_party/flashinfer/
+
+# Local measurements, personal planning, and agent/environment configuration.
+/artifacts/
+/results_*.json
+*.log
+/README_ATTENTION_BLOCK_ROADMAP.md
+/.agents/
+/.codex/
+.env
+.env.*
+!.env.example

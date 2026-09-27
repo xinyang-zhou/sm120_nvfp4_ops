@@ -62,7 +62,8 @@ target_link_libraries(
 
 add_library(sm120_nvfp4_attention STATIC
   src/attention/sparse_mla/decode.cu
-  src/attention/sparse_mla/prefill.cu)
+  src/attention/sparse_mla/prefill.cu
+  src/attention/sparse_mla/cache.cu)
 sm120_nvfp4_configure_target(sm120_nvfp4_attention)
 target_link_libraries(
   sm120_nvfp4_attention PUBLIC sm120_nvfp4_gemm CUDA::cudart)
@@ -108,10 +109,11 @@ if(SM120_NVFP4_BUILD_TORCH)
     SUFFIX ".so"
     BUILD_RPATH "${TORCH_ROOT}/lib"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python/sm120_nvfp4")
-  add_custom_command(TARGET _C POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      ${PROJECT_SOURCE_DIR}/python/sm120_nvfp4/__init__.py
-      ${CMAKE_BINARY_DIR}/python/sm120_nvfp4/__init__.py
+  add_custom_target(sm120_nvfp4_python ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+      ${PROJECT_SOURCE_DIR}/python/sm120_nvfp4
+      ${CMAKE_BINARY_DIR}/python/sm120_nvfp4
+    DEPENDS _C
     COMMENT "Syncing the Python package into the build tree")
   install(TARGETS _C LIBRARY DESTINATION sm120_nvfp4)
   install(DIRECTORY python/sm120_nvfp4/ DESTINATION sm120_nvfp4

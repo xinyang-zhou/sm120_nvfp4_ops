@@ -152,6 +152,18 @@ def sparse_mla_prefill(
     )
 
 
+def sparse_mla_pack_cache(values: torch.Tensor, slots: torch.Tensor,
+                          cache: torch.Tensor) -> torch.Tensor:
+    """Append BF16 values[N,512] to packed NVFP4 cache at int32 slots[N].
+
+    Cache is uint8 [pages,64,384] (singleton-head HND/NHD also accepted).
+    Valid destination slots must be unique within the call. Invalid slots
+    are skipped. All tensors must be contiguous on the same SM120 device;
+    cache must not alias values/slots. Writes are ordered on the current stream.
+    """
+    return torch.ops.sm120_nvfp4.sparse_mla_pack_cache(values, slots, cache)
+
+
 def grouped_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -299,7 +311,15 @@ def scale_b_elements(m: int, n: int, k: int) -> int:
     return ((n + 127) // 128 * 128) * scale_k_padded(k)
 
 
+from .dsv4 import DSV4CSAAttentionBlock
+from .dsv4_state import DSV4CSAConfig, DSV4CSAState
+
+
 __all__ = [
+    "DSV4CSAAttentionBlock",
+    "DSV4CSAConfig",
+    "DSV4CSAState",
+    "sparse_mla_pack_cache",
     "sparse_mla_prefill",
     "sparse_mla_decode",
     "sparse_mla_decode_workspace_bytes",

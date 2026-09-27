@@ -71,4 +71,12 @@ GemmStatus sparse_mla_decode_sm120(const SparseMlaDecodeParams& params,
 GemmStatus sparse_mla_prefill_sm120(const SparseMlaPrefillParams& params,
                                   cudaStream_t stream = nullptr);
 
+// Append BF16 values[rows,512] to existing footer-scale NVFP4 pages. Each
+// nonnegative in-range slot must be unique within this call. Invalid slots
+// are skipped. Inputs must not overlap cache; previous cache reads must be
+// complete or ordered before this write on the same stream.
+GemmStatus sparse_mla_pack_cache_sm120(int rows, const __nv_bfloat16* values,
+    const std::int32_t* slots, std::uint8_t* cache, int pages,
+    cudaStream_t stream = nullptr);
+
 }  // namespace sm120_nvfp4
