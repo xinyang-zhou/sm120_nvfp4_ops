@@ -6,6 +6,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 .venv/
 *.ncu-rep
 *.nsys-rep
@@ -27,3 +28,16 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Raw measurements can contain host paths, device IDs and local worktree names.
+/benchmarks/results/*.json
+/benchmarks/results/*.csv
+/benchmarks/results/*.txt
+/benchmarks/results/*.log
+*.nsys-rep.sqlite
+*.qdrep
+*.sqlite
+*.sqlite-journal
+*.cubin
+*.ptx
+*.sass

@@ -120,6 +120,25 @@ class SparseMlaTest(unittest.TestCase):
         torch.testing.assert_close(output, expected, rtol=.04, atol=.006)
         torch.testing.assert_close(lse, expected_lse, rtol=2e-5, atol=3e-4)
 
+    def test_output_with_two_byte_alignment(self):
+        problem = make_problem(batch=1, swa=65, compressed=17)
+        for name, kwargs in (("sparse_mla_decode", dict(chunks_per_cta=1)),
+                             ("sparse_mla_decode", dict(chunks_per_cta=3)),
+                             ("sparse_mla_prefill", {})):
+            with self.subTest(name=name, kwargs=kwargs):
+                run = getattr(sm120_nvfp4, name)
+                expected, expected_lse = run(*problem, **kwargs)
+                backing = torch.full((problem[0].numel() + 2,), 17.,
+                                     dtype=torch.bfloat16, device="cuda")
+                output = backing[1:-1].view_as(problem[0])
+                self.assertEqual(output.data_ptr() % 4, 2)
+                actual, lse = run(*problem, output=output, **kwargs)
+                self.assertEqual(actual.data_ptr(), output.data_ptr())
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+                self.assertEqual(backing[0].item(), 17.)
+                self.assertEqual(backing[-1].item(), 17.)
+
     def test_binding_rejects_wrong_contract(self):
         problem = list(make_problem(batch=1))
         with self.assertRaisesRegex(RuntimeError, "dtype"):

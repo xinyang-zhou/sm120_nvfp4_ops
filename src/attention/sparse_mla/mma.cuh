@@ -37,31 +37,31 @@ CUTE_DEVICE void nv_mma(const std::uint8_t* ap, const std::uint8_t* bp,
                         const std::uint8_t* asp, const std::uint8_t* bsp,
                         float (&acc)[4], int lane) {
   using namespace cute;
+  static_assert(AStride % 4 == 0 && BStride % 4 == 0,
+                "Packed FP4 fragment loads require 4-byte row alignment");
   auto a = make_tensor<uint4_t>(Layout<_32>{});
   auto b = make_tensor<uint4_t>(Layout<_16>{});
-  clear(a);
-  clear(b);
+  auto a32 = recast<std::uint32_t>(a);
+  auto b32 = recast<std::uint32_t>(b);
   using SfLayout = Layout<Shape<Shape<_16, _4>>, Stride<Stride<_0, _1>>>;
   auto sa = make_tensor<cutlass::float_ue4m3_t>(SfLayout{});
   auto sb = make_tensor<cutlass::float_ue4m3_t>(SfLayout{});
   auto c = make_tensor(make_rmem_ptr(acc), Layout<_4>{});
-  auto am = make_tensor(make_smem_ptr(ap),
-                        make_layout(make_shape(_16{}, _32{}),
-                                    make_stride(Int<AStride>{}, _1{})));
-  auto bm = make_tensor(make_smem_ptr(bp),
-                        make_layout(make_shape(_8{}, _32{}),
-                                    make_stride(Int<BStride>{}, _1{})));
+  // Eight consecutive fragment nibbles are one aligned word along K in
+  // these SM120 layouts. All callers provide 4-byte-aligned shared bases.
+  // Load the packed register bits directly instead of extracting/repacking
+  // individual nibbles. The existing row layout (and bank mapping) is kept.
 #pragma unroll
-  for (int i = 0; i < 32; ++i) {
-    int coord = NvTraits::ALayout{}(lane, i);
-    int k = coord / 16;
-    a(i) = uint4_t((am(coord % 16, k / 2) >> (4 * (k & 1))) & 15);
+  for (int i = 0; i < 4; ++i) {
+    int coord = NvTraits::ALayout{}(lane, i * 8);
+    a32(i) = *reinterpret_cast<const std::uint32_t*>(
+        ap + (coord % 16) * AStride + (coord / 16) / 2);
   }
 #pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    int coord = NvTraits::BLayout{}(lane, i);
-    int k = coord / 8;
-    b(i) = uint4_t((bm(coord % 8, k / 2) >> (4 * (k & 1))) & 15);
+  for (int i = 0; i < 2; ++i) {
+    int coord = NvTraits::BLayout{}(lane, i * 8);
+    b32(i) = *reinterpret_cast<const std::uint32_t*>(
+        bp + (coord % 8) * BStride + (coord / 8) / 2);
   }
   int ar = NvTraits::SFALayout{}(lane, 0) % 16;
   int br = NvTraits::SFBLayout{}(lane, 0) % 8;
@@ -75,17 +75,31 @@ CUTE_DEVICE void nv_mma(const std::uint8_t* ap, const std::uint8_t* bp,
 
 // B can be token-major (QK) or its logical transpose (PV). Element strides
 // describe that choice without materializing a transposed BF16 cache.
-template <int ARowStride, int BRowStride, int BKStride>
+template <int ARowStride, int BRowStride, int BKStride, bool PackedA = false>
 CUTE_DEVICE void bf_mma(const __nv_bfloat16* ap, const __nv_bfloat16* bp,
                         float (&acc)[4], int lane) {
   using namespace cute;
   auto a = make_tensor<cutlass::bfloat16_t>(Layout<_8>{});
   auto b = make_tensor<cutlass::bfloat16_t>(Layout<_4>{});
   auto c = make_tensor(make_rmem_ptr(acc), Layout<_4>{});
+  if constexpr (PackedA) {
+    static_assert(ARowStride % 2 == 0, "Packed BF16 A loads need even row stride");
+    // Q and padded shared-weight callers provide 16-byte-aligned bases.
+    // ALayout maps each consecutive fragment pair to adjacent BF16 values
+    // at an even K, satisfying the 4-byte alignment of the packed load.
+    auto a32 = recast<std::uint32_t>(a);
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    int coord = BfTraits::ALayout{}(lane, i);
-    a(i) = cutlass::bfloat16_t(__bfloat162float(ap[(coord % 16) * ARowStride + coord / 16]));
+    for (int i = 0; i < 4; ++i) {
+      int coord = BfTraits::ALayout{}(lane, i * 2);
+      a32(i) = *reinterpret_cast<const std::uint32_t*>(
+          ap + (coord % 16) * ARowStride + coord / 16);
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      int coord = BfTraits::ALayout{}(lane, i);
+      a(i) = cutlass::bfloat16_t(__bfloat162float(ap[(coord % 16) * ARowStride + coord / 16]));
+    }
   }
 #pragma unroll
   for (int i = 0; i < 4; ++i) {

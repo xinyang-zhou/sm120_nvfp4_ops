@@ -45,7 +45,7 @@ Current measurements for `N=4096, K=8192`:
 These GEMM rows are retained historical measurements. They predate the
 structured writer, so the original JSON/CSV files are not present in the
 repository. Re-run the commands below and check in their generated artifacts
-before using the numbers as fully traceable resume evidence.
+before using the numbers as fully traceable performance evidence.
 
 Measurement counts:
 
@@ -127,12 +127,70 @@ Consequently, the historical M=512 result means “configured CUTLASS Collective
 
 ## DS-V4 CSA sparse MLA decode and prefill
 
-The new C++ CuTe sparse MLA kernel has not yet been compiled, tested or
-benchmarked on the GPU server. See [Sparse MLA](SPARSE_MLA.md) for its
-numerical reference, validation gates and reproducible FlashInfer A/B commands.
-The current benchmark script measures decode. Prefill reuses the same CuTe
-loop with one CTA/query and zero workspace; its throughput and occupancy
-remain unmeasured.
+Measured 2026-09-27 on one RTX 5090, using the retained warp-specialized
+implementation (eight compute plus four IO warps, two raw-KV stages).
+The same main kernel serves all three batches; default chunk scheduling
+uses CPB=9/two splits at B=64 and CPB=10/one split at B=512/1024.
+
+| Batch | This library P50 / μs | FlashInfer P50 / μs | Speedup (FI/ours) | Latency reduction |
+|---|---:|---:|---:|---:|
+| 64 | 73.728 | 112.640 | 1.528× | 34.55% |
+| 512 | 280.576 | 464.864 | 1.657× | 39.64% |
+| 1024 | 475.136 | 801.792 | 1.688× | 40.74% |
+
+Conditions and scope:
+
+- CUDA 13.2 compiler, PyTorch 2.7.0+cu128 (PyTorch reports CUDA 12.8),
+  CUTLASS 4.2.1; FlashInfer 0.7.0 at revision
+  `ea728cb558c32a3c58ec8fbd5a154ff676b9ab70`.
+  This measurement used an attention-only extension in that environment;
+  the full repository's GEMM/MoE bindings require a newer PyTorch build with
+  `torch.float4_e2m1fn_x2`. Do not treat 2.7 as a full-build requirement.
+- CSA single-token decode with 32768 history tokens per request, 64 query
+  heads, D=448+64, 128 SWA and 512 selected compressed candidates. Synthetic
+  unit-RMS inputs, random sink, seed43; random unique chronological selection.
+- BF16 Q/output, NVFP4 non-RoPE and BF16 RoPE QK/PV. Baseline is the public
+  sparse NVFP4 API with its own planner, not an artificially matched-CPB path.
+- Twenty warmups, five rounds of 100 CUDA Graph samples per backend/batch,
+  pooled P50; fixed inputs with 256 MiB L2 disturbance before each call and
+  outside the event interval. Backend measurement order alternates by batch.
+- No profiler; clocks were not locked. Background processes were allowed,
+  but monitoring detected no foreign compute process during this run.
+- Includes online Q/P/V conversion and any required split merge. Excludes
+  cache packing, compressor/indexer/selection, RoPE, projections, model
+  scheduling, setup, JIT and reference calculations.
+
+The sparse MLA suite passed 25 tests including FlashInfer integration. In
+this paired benchmark all three cases passed; output RMSE versus FlashInfer
+was 2.02e-6, 1.90e-6 and 1.89e-6, with no nonfinite outputs. Public FlashInfer
+does not return LSE, so this library's LSE was checked against the independent
+reference instead. These checks do not establish model-quality equivalence.
+Prefill shares the kernel and is correctness-tested, but no prefill speedup
+is claimed. A separate sanitizer run of this warp-specialized revision is
+still outstanding.
+
+Measured source identifiers (SHA256):
+
+- `src/attention/sparse_mla/decode.cu`:
+  `236f2653a7f1e9f76123cb386c1dec814354f943fbb803075e6be0420ad09602`
+- `src/attention/sparse_mla/mma.cuh`:
+  `90dbd35ee72268766391f809472d962a0f7f6974a211bfc667e541f4cf487dd4`
+
+Reproduce after building the extension (the output must not already exist):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/build/python" \
+python3 benchmarks/benchmark_attention_ops.py \
+  --modes decode --kinds csa --batches 64 512 1024 \
+  --context-length 32768 --warmup 20 --rounds 5 --samples 100 --seed 43 \
+  --flashinfer --flashinfer-dispatch public \
+  --output temp/attention_flashinfer_new.json
+```
+
+Raw results, NCU reports and internal optimization notes are intentionally
+kept locally under ignored `temp/`, not checked in. Only the reviewed summary,
+measurement conditions and source identifiers are published. See
+[Sparse MLA](SPARSE_MLA.md) for the interface and validation commands.
 
 ## Generated instruction verification
 
@@ -190,26 +248,12 @@ expert-major input for both paths:
   `fused_moe`, which repeats local count/gather/reduce and creates temporary
   tensors.
 
-Configuration: 2 x RTX 5090 (physical GPU 1,2), cross-NUMA `SYS` PCIe path,
-256 tokens/rank, hidden 4096, intermediate 2048, top-k 2, 32 experts, 10
-warmups and 100 alternating paired measurements. Times are the slower rank's
-wall-clock P50.
-
-| Routing | Expert M range | Direct compute | Reroute compute | Compute speedup | Direct end-to-end | Reroute end-to-end | E2E speedup | Max diff |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Balanced | 32--32 | 0.2365 ms | 0.3002 ms | 1.27x | 0.8187 ms | 0.8496 ms | 1.04x | 0 |
-| 80% rank-skewed | 0--408 | 0.1506 ms | 0.2049 ms | 1.36x | 0.7905 ms | 0.8175 ms | 1.03x | 0 |
-
-This is an integration/control-path benchmark using a transparent
+This optional two-GPU integration benchmark uses a transparent
 `torch.distributed` NCCL reference transport. It is **not** a native DeepEP
-kernel or NVLink/RDMA bandwidth result. The useful result is that consuming
-the dispatcher layout directly reduces the local Expert compute path while
-keeping Dispatch/Combine semantics unchanged. Raw results:
-[balanced](../benchmarks/results/deepep_handoff_balanced_rtx5090_2026-09-11.json)
-and
-[skewed](../benchmarks/results/deepep_handoff_skewed_rtx5090_2026-09-11.json).
-The direct/reroute equivalence test also passes CUDA Compute Sanitizer memcheck
-with [0 errors](../benchmarks/results/expert_moe_memcheck_rtx5090_2026-09-11.txt).
+kernel or NVLink/RDMA bandwidth result. Historical hand-off timing tables and
+raw artifacts have been removed from the public snapshot; the interface and
+reproduction script remain. The current headline comparison is sparse
+attention versus FlashInfer above.
 
 ```bash
 CUDA_VISIBLE_DEVICES=1,2 NCCL_IB_DISABLE=1 \
@@ -219,11 +263,11 @@ torchrun --standalone --nproc-per-node=2 \
   --tokens 256 --hidden 4096 --intermediate 2048 \
   --experts 32 --topk 2 --routing balanced \
   --warmup 10 --iterations 100 \
-  > benchmarks/results/deepep_handoff_balanced_rtx5090_YYYY-MM-DD.json
+  > temp/deepep_handoff_balanced_new.json
 ```
 
-Use `--routing skewed` and the corresponding `skewed` output filename for the
-second row. Reproduce the memcheck evidence with:
+Create `temp/` first. Use `--routing skewed` and a different output filename
+for skewed routing. To check the direct/reroute interface with memcheck:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH="$PWD/build/python" \

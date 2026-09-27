@@ -133,7 +133,10 @@ by the caller. Query rows can be sliced into separate launches without changing
 their candidate grouping or numerical path; this does not implement compressor
 state management for chunked prefill.
 See [Sparse MLA](SPARSE_MLA.md) for the source/math mapping and validation
-status. The new kernel has not yet been compiled or tested on the server.
+status. The current kernel uses eight compute plus four IO warps, two raw
+stages with ready/free hand-off, and a 98 KiB shared footprint. The sparse
+MLA suite passes 25 tests on RTX 5090; measured CSA decode results are in
+[Performance](PERFORMANCE.md#ds-v4-csa-sparse-mla-decode-and-prefill).
 
 ## Grouped GEMM
 

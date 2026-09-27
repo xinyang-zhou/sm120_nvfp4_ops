@@ -1,10 +1,12 @@
 # Benchmark result index
 
 This directory is the evidence index for performance claims in the repository.
-A documentation table is not itself a raw benchmark artifact. `verified`
-below means that a checked-in machine-readable result contains the measurement,
-configuration and correctness outcome; `rerun required` means that the number
-is historical and must not be presented as fully traceable evidence yet.
+A documentation table is not itself a raw benchmark artifact. Raw local
+measurements are kept under ignored `temp/`, because they can contain personal
+paths, device IDs and worktree details. This directory keeps only the public
+evidence index. `locally validated` means measured and correctness-checked,
+with raw data retained privately; it does not mean raw evidence is checked in.
+`rerun required` identifies older historical claims without retained evidence.
 
 | Claim | Documentation | Raw artifact | Reproduction | Status |
 |---|---|---|---|---|
@@ -12,9 +14,11 @@ is historical and must not be presented as fully traceable evidence yet.
 | Default fixed-M GEMM, M=128/256 | [Performance](../../docs/PERFORMANCE.md#default-fixed-m-dispatcher) | Interactive reports intentionally not retained | Commands below | rerun required |
 | M=512 scalar 35.0 us to TMA 28.4 us | [Performance](../../docs/PERFORMANCE.md#custom-cute-single-gemm) | Not retained; scalar code is commit `4f227c7`, TMA code is commit `51fde90` | Benchmark both revisions under identical conditions | rerun required |
 | Persistent Grouped GEMM, 1--32 groups | [Performance](../../docs/PERFORMANCE.md#grouped-gemm) | Not retained by the original run | Commands below | rerun required |
-| Balanced Expert-major handoff | [Performance](../../docs/PERFORMANCE.md#deepep-compatible-fused-moe-hand-off) | [`deepep_handoff_balanced_rtx5090_2026-09-11.json`](deepep_handoff_balanced_rtx5090_2026-09-11.json) | [Performance command](../../docs/PERFORMANCE.md#deepep-compatible-fused-moe-hand-off) | verified |
-| Skewed Expert-major handoff | [Performance](../../docs/PERFORMANCE.md#deepep-compatible-fused-moe-hand-off) | [`deepep_handoff_skewed_rtx5090_2026-09-11.json`](deepep_handoff_skewed_rtx5090_2026-09-11.json) | Use the same command with `--routing skewed` | verified |
-| Expert-major memcheck | [Performance](../../docs/PERFORMANCE.md#deepep-compatible-fused-moe-hand-off) | [`expert_moe_memcheck_rtx5090_2026-09-11.txt`](expert_moe_memcheck_rtx5090_2026-09-11.txt) | [Performance command](../../docs/PERFORMANCE.md#deepep-compatible-fused-moe-hand-off) | verified |
+| CSA sparse decode vs FlashInfer, B=64/512/1024 | [Performance](../../docs/PERFORMANCE.md#ds-v4-csa-sparse-mla-decode-and-prefill) | Private latest data in ignored `temp/`; no public raw artifact | Command and source hashes in Performance | locally validated, 2026-09-27 |
+
+Old DeepEP-compatible timing artifacts are no longer published. The optional
+integration benchmark remains available, without a current performance claim.
+Never force-add raw result files without reviewing their metadata for privacy.
 
 ## Single GEMM rerun
 

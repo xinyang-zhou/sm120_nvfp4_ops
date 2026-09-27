@@ -5,8 +5,11 @@
 执行程序不作为本轮目标。完整 block 和单层对照不是算子验收的前置条件。
 后续 profile 优化及 SGLang adapter 独立推进。
 
-本轮代码仅在 WSL 开发和静态检查。所有构建、测试、benchmark、sanitizer 和
-profiler 采集都在服务器执行；下面的验收条件不是已通过的结果。
+当前 sparse MLA 已在 RTX 5090 构建，通过 25 项正确性测试（含 FlashInfer），
+并完成 B=64/512/1024 的 CSA decode 对照及 B512 NCU 分析。最新数据见
+[Performance](PERFORMANCE.md#ds-v4-csa-sparse-mla-decode-and-prefill)。
+下面是完整算子栈的复现/验收流程，不表示所有项目已在当前版本重新通过；
+尤其当前 warp-specialized attention 尚未单独完成 sanitizer 验证。
 
 ## 目标算子
 

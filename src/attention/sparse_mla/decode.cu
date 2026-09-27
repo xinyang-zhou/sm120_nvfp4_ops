@@ -11,12 +11,20 @@
 #include <math_constants.h>
 #include "mma.cuh"
 #include "quantization.cuh"
+#include "cutlass/arch/reg_reconfig.h"
 
 namespace sm120_nvfp4::sparse_mla {
 
 constexpr int kHeads = 64, kDim = 512, kNope = 448, kRope = 64;
 constexpr int kCandidates = 64, kWarps = 8, kThreads = 256;
 constexpr int kStages = 2;
+constexpr int kIoThreads = 128, kBlockThreads = kThreads + kIoThreads;
+// Odd counts of 16-byte groups per row separate the FP4 MMA A-load banks.
+// Q and P padding together use 2 KiB more shared memory.
+constexpr int kQStride = 240, kPStride = 48;
+// Eight BF16 padding elements shift consecutive rows by four banks. With the
+// BF16 MMA A layout, a warp's eight rows then occupy disjoint bank groups.
+constexpr int kWeightStride = 72;
 constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kEmpty = -1.0e30f;
 
@@ -26,14 +34,24 @@ struct alignas(16) RawTile {
   int valid[64];
 };
 
+struct ValueTile {
+  std::uint8_t data[448][32];
+  std::uint8_t scale[448][4];
+};
+
 struct alignas(16) SharedStorage {
-  std::uint8_t q[64][224];
+  std::uint8_t q[64][kQStride];
   std::uint8_t qs[64][28];
   RawTile raw[kStages];
-  std::uint8_t vt[448][32];
-  std::uint8_t vts[448][4];
-  __nv_bfloat16 weight[64][64];
-  std::uint8_t p[64][32];
+  // BF16 PV and P quantization consume weight before prepare_v overwrites
+  // it. A CTA barrier separates those readers from the aliased V writes.
+  union {
+    ValueTile value;
+    __nv_bfloat16 weight[64][kWeightStride];
+  };
+  // Persistent across chunks; the union above pays for this padded cache.
+  __nv_bfloat16 q_rope[64][kWeightStride];
+  std::uint8_t p[64][kPStride];
   std::uint8_t ps[64][4];
   float local_max[64][8];
   float local_sum[64][8];
@@ -65,56 +83,103 @@ __device__ __forceinline__ int slot_for(const SparseMlaDecodeParams& p,
              ? slot : -1;
 }
 
-// All 256 threads commit one async-copy group, including threads with only
-// masked rows. wait_prior(0)+CTA barrier is mandatory before consuming it.
+// Compute-only rendezvous: producer warps never participate in barrier 0.
+__device__ __forceinline__ void compute_sync() {
+  asm volatile("bar.sync 0, %0;" : : "n"(kThreads) : "memory");
+}
+
+// Stage-ready (1/2) and stage-free (3/4) each include producer + consumers.
+__device__ __forceinline__ void stage_wait(int barrier) {
+  asm volatile("bar.sync %0, %1;" : : "r"(barrier), "n"(kBlockThreads) : "memory");
+}
+
+__device__ __forceinline__ void stage_arrive(int barrier) {
+  asm volatile("bar.arrive %0, %1;" : : "r"(barrier), "n"(kBlockThreads) : "memory");
+}
+
+// Four IO warps own sixteen rows each. All lanes commit/wait their groups,
+// including lanes with no copies, before publishing data through ready.
 __device__ __forceinline__ void prefetch(const SparseMlaDecodeParams& p, RawTile& tile,
-                         int batch, int chunk) {
-  for (int v = threadIdx.x; v < 64 * 24; v += kThreads) {
-    int row = v / 24, vec = v % 24;
-    bool swa;
-    int slot = slot_for(p, batch, chunk, row, swa);
-    const std::uint8_t* source = reinterpret_cast<const std::uint8_t*>(p.query);
-    if (slot >= 0) {
-      const std::uint8_t* pool = swa ? p.swa_cache : p.compressed_cache;
-      source = pool + static_cast<std::int64_t>(slot / 64) * (64 * 384);
-      source += vec < 22 ? (slot % 64) * 352 + vec * 16
-                        : 64 * 352 + (slot % 64) * 32 + (vec - 22) * 16;
-    }
-    std::uint8_t* dest = vec < 22 ? tile.data[row] + vec * 16
-                                : tile.scale[row] + (vec - 22) * 16;
-    __pipeline_memcpy_async(dest, source, 16, slot < 0 ? 16 : 0);
+                                        int batch, int chunk) {
+  const int lane = threadIdx.x % 32, io_warp = (threadIdx.x - kThreads) / 32;
+  const bool swa = chunk < (p.swa_candidates + 63) / 64;
+  const std::uint8_t* pool = swa ? p.swa_cache : p.compressed_cache;
+  int cached_slot = -1;
+  if (lane < 16) {
+    bool unused_swa;
+    cached_slot = slot_for(p, batch, chunk, io_warp * 16 + lane, unused_swa);
+    tile.valid[io_warp * 16 + lane] = cached_slot >= 0;
   }
-  if (threadIdx.x < 64) {
-    bool swa;
-    tile.valid[threadIdx.x] = slot_for(p, batch, chunk, threadIdx.x, swa) >= 0;
+#pragma unroll 1
+  for (int r = 0; r < 16; ++r) {
+    const int slot = __shfl_sync(0xffffffff, cached_slot, r);
+    if (lane < 24) {
+      const int row = io_warp * 16 + r, vec = lane;
+      const std::uint8_t* source = reinterpret_cast<const std::uint8_t*>(p.query);
+      if (slot >= 0) {
+        source = pool + static_cast<std::int64_t>(slot / 64) * (64 * 384);
+        source += vec < 22 ? (slot % 64) * 352 + vec * 16
+                          : 64 * 352 + (slot % 64) * 32 + (vec - 22) * 16;
+      }
+      std::uint8_t* dest = vec < 22 ? tile.data[row] + vec * 16
+                                  : tile.scale[row] + (vec - 22) * 16;
+      __pipeline_memcpy_async(dest, source, 16, slot < 0 ? 16 : 0);
+    }
   }
   __pipeline_commit();
 }
 
 __device__ __forceinline__ void prepare_v(const RawTile& raw, SharedStorage& sm) {
-  // One worker owns an entire group of 16 candidates for one output channel.
+  // One worker owns 16 candidates for two adjacent output channels. Both
+  // channels share one packed FP4 byte and one scale for each candidate.
   // Cache scales are absorbed BEFORE requantizing along the candidate axis.
-  for (int i = threadIdx.x; i < 448 * 4; i += kThreads) {
-    int dim = i / 4, group = i % 4;
-    float values[16];
+  // Rotate channel-pair assignments by 0/36/72/108, retaining the original
+  // 0/72/144/216 channel offsets between candidate groups.
+  // Three full paired rounds, followed by one single-channel round below.
+  // All warps then quantize seven channels per lane instead of eight/six.
+  for (int i = threadIdx.x; i < 3 * kThreads; i += kThreads) {
+    int group = i % 4;
+    int pair = i / 4 + group * 36;
+    if (pair >= 224) pair -= 224;
+    int dim = pair * 2;
+    float even[16], odd[16];
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
       int row = group * 16 + j;
       __nv_fp4x2_e2m1 packed;
-      packed.__x = raw.data[row][dim / 2];
+      packed.__x = raw.data[row][pair];
       float2 decoded = static_cast<float2>(packed);
-      values[j] = ((dim & 1) ? decoded.y : decoded.x) *
-                  scale_value(raw.scale[row][dim / 16]);
+      float scale = scale_value(raw.scale[row][dim / 16]);
+      even[j] = decoded.x * scale;
+      odd[j] = decoded.y * scale;
     }
-    quantize16(values, sm.vt[dim] + group * 8, sm.vts[dim] + group);
+    quantize16(even, sm.value.data[dim] + group * 8, sm.value.scale[dim] + group);
+    quantize16(odd, sm.value.data[dim + 1] + group * 8, sm.value.scale[dim + 1] + group);
   }
+  // Spread the remaining 128 channel pairs over all 256 threads. Only this
+  // tail gives up pair reuse; every warp reaches the following CTA barrier
+  // after the same amount of channel quantization work.
+  int group = threadIdx.x % 4;
+  int dim = 384 + threadIdx.x / 4 + group * 72;
+  if (dim >= 448) dim -= 448;
+  float values[16];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    int row = group * 16 + j;
+    __nv_fp4x2_e2m1 packed;
+    packed.__x = raw.data[row][dim / 2];
+    float2 decoded = static_cast<float2>(packed);
+    values[j] = ((dim & 1) ? decoded.y : decoded.x) *
+                scale_value(raw.scale[row][dim / 16]);
+  }
+  quantize16(values, sm.value.data[dim] + group * 8, sm.value.scale[dim] + group);
 }
 
 __device__ __forceinline__ float exponent(float lse, float maximum) {
   return lse > -1.e29f ? exp2f(lse - maximum) : 0.f;
 }
 
-__global__ __launch_bounds__(kThreads, 1)
+__global__ __launch_bounds__(kBlockThreads, 1)
 void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
                    int splits, __nv_bfloat16* partial, float* partial_lse) {
   extern __shared__ __align__(16) unsigned char shared[];
@@ -125,6 +190,32 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
   const int begin = split * chunks_per_cta;
   const int end = min(chunks, begin + chunks_per_cta);
 
+  // Dedicated producer: it may fill the next stage while compute warps use
+  // the current one, and must not overwrite a stage until all readers leave.
+  if (tid >= kThreads) {
+    // One whole producer warpgroup releases registers to the two consumers.
+    cutlass::arch::warpgroup_reg_dealloc<40>();
+    int write_stage = 0;
+    for (int chunk = begin; chunk < end; ++chunk) {
+      if (chunk >= begin + kStages) stage_wait(3 + write_stage);
+      prefetch(p, sm.raw[write_stage], batch, chunk);
+      __pipeline_wait_prior(0);
+      stage_arrive(1 + write_stage);
+      if (++write_stage == kStages) write_stage = 0;
+    }
+    return;
+  }
+
+  cutlass::arch::warpgroup_reg_alloc<232>();
+
+  // Cache each head's 64 BF16 RoPE values once per CTA. The padded stride
+  // keeps packed MMA A loads conflict-free without keeping Q in registers.
+  for (int i = tid; i < 64 * 8; i += kThreads) {
+    const int row = i / 8, vec = i % 8;
+    __pipeline_memcpy_async(sm.q_rope[row] + vec * 8,
+                            q + row * 512 + 448 + vec * 8, 16);
+  }
+  __pipeline_commit();
   for (int i = tid; i < 64 * 28; i += kThreads) {
     int row = i / 28, group = i % 28;
     float values[16];
@@ -142,26 +233,21 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
   // tile for all 64 heads. These FP32 accumulators live across all chunks.
   float output[4][7][4] = {};
   float rope_output[4][4] = {};
-  // Two raw-KV stages: prefetch the next chunk while consuming the current
-  // one. Async-copy waits and CTA barriers synchronize stage reuse without
-  // tracking a barrier phase.
+  // Complete compute-owned Q copies; raw KV is published independently by IO.
   int read_stage = 0;
-  int write_stage = 1;
-  if (begin < end) prefetch(p, sm.raw[read_stage], batch, begin);
   __pipeline_wait_prior(0);
-  __syncthreads();
+  compute_sync();
 
   for (int chunk = begin; chunk < end; ++chunk) {
+    stage_wait(1 + read_stage);
     const RawTile& raw = sm.raw[read_stage];
-    // Next raw tile can arrive while CuTe MMA/softmax/PV consume this one.
-    if (chunk + 1 < end) prefetch(p, sm.raw[write_stage], batch, chunk + 1);
 
     float scores[4][4] = {};
 #pragma unroll
     for (int k = 0; k < 7; ++k) {
 #pragma unroll
       for (int g = 0; g < 4; ++g) {
-        nv_mma<224, 352, 28, 32>(sm.q[g * 16] + k * 32,
+        nv_mma<kQStride, 352, 28, 32>(sm.q[g * 16] + k * 32,
                                  raw.data[warp * 8] + k * 32,
                                  sm.qs[g * 16] + k * 4,
                                  raw.scale[warp * 8] + k * 4, scores[g], lane);
@@ -171,7 +257,7 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
     for (int k = 0; k < 4; ++k) {
 #pragma unroll
       for (int g = 0; g < 4; ++g) {
-        bf_mma<512, 176, 1>(q + g * 16 * 512 + 448 + k * 16,
+        bf_mma<kWeightStride, 176, 1, true>(sm.q_rope[g * 16] + k * 16,
                             reinterpret_cast<const __nv_bfloat16*>(raw.data[warp * 8] + 224) + k * 16,
                             scores[g], lane);
       }
@@ -205,7 +291,7 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
         }
       }
     }
-    __syncthreads();
+    compute_sync();
     if (tid < 64) {
       float block_max = kEmpty;
 #pragma unroll
@@ -220,7 +306,7 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
       sm.maximum[tid] = next;
       sm.alpha[tid] = alpha;
     }
-    __syncthreads();
+    compute_sync();
 #pragma unroll
     for (int g = 0; g < 4; ++g) {
 #pragma unroll
@@ -234,7 +320,7 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
         for (int v = 0; v < 7; ++v) output[g][v][i] *= sm.alpha[row];
       }
     }
-    __syncthreads();
+    compute_sync();
 
     // Distinct W/P buffers avoid an in-place float-to-FP4 read/write race.
     int prow = tid / 4, pg = tid % 4;
@@ -242,8 +328,25 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
 #pragma unroll
     for (int j = 0; j < 16; ++j) weights[j] = __bfloat162float(sm.weight[prow][pg * 16 + j]);
     quantize16(weights, sm.p[prow] + pg * 8, sm.ps[prow] + pg);
+    // Finish all BF16 weight consumers before reusing the same storage for V.
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      float contribution[4] = {};
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        bf_mma<kWeightStride, 1, 176, true>(sm.weight[g * 16] + k * 16,
+                            reinterpret_cast<const __nv_bfloat16*>(raw.data[k * 16] + 224) + warp * 8,
+                            contribution, lane);
+      }
+#pragma unroll
+      for (int i = 0; i < 4; ++i) rope_output[g][i] += contribution[i];
+    }
+    compute_sync();
     prepare_v(raw, sm);
-    __syncthreads();
+    compute_sync();
+    // No raw readers remain. IO can recycle this stage during FP4 PV, whose
+    // operands live in the separate ValueTile and P buffers.
+    if (chunk + kStages < end) stage_arrive(3 + read_stage);
 
 #pragma unroll
     for (int v = 0; v < 7; ++v) {
@@ -252,33 +355,15 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
       for (int g = 0; g < 4; ++g) {
         // Match the document's FP32 chunk product followed by FP32 addition.
         float contribution[4] = {};
-        nv_mma<32, 32, 4, 4>(sm.p[g * 16], sm.vt[dim], sm.ps[g * 16],
-                              sm.vts[dim], contribution, lane);
+        nv_mma<kPStride, 32, 4, 4>(sm.p[g * 16], sm.value.data[dim], sm.ps[g * 16],
+                              sm.value.scale[dim], contribution, lane);
 #pragma unroll
         for (int i = 0; i < 4; ++i) output[g][v][i] += contribution[i];
       }
     }
-#pragma unroll
-    for (int g = 0; g < 4; ++g) {
-      float contribution[4] = {};
-#pragma unroll
-      for (int k = 0; k < 4; ++k) {
-        bf_mma<64, 1, 176>(sm.weight[g * 16] + k * 16,
-                            reinterpret_cast<const __nv_bfloat16*>(raw.data[k * 16] + 224) + warp * 8,
-                            contribution, lane);
-      }
-#pragma unroll
-      for (int i = 0; i < 4; ++i) rope_output[g][i] += contribution[i];
-    }
-    // Every read-stage reader and asynchronous write-stage writer has
-    // finished before either raw stage can be consumed/recycled.
-    __pipeline_wait_prior(0);
-    __syncthreads();
-
-    ++read_stage;
-    if (read_stage == kStages) read_stage = 0;
-    ++write_stage;
-    if (write_stage == kStages) write_stage = 0;
+    // Keep compute's V/weight union and P reuse ordered across chunks.
+    compute_sync();
+    if (++read_stage == kStages) read_stage = 0;
   }
 
   if (tid < 64) {
@@ -299,20 +384,44 @@ void attention_kernel(SparseMlaDecodeParams p, int chunks_per_cta, int chunks,
     }
     sm.alpha[tid] = factor;
   }
-  __syncthreads();
+  compute_sync();
+  // MMA C fragment elements (0,1) and (2,3) are adjacent column pairs.
+  // Pack each pair into one aligned 32-bit global store. Keep the
+  // scalar path for user-provided BF16 views with only 2-byte alignment.
+  if (splits > 1 || (reinterpret_cast<std::uintptr_t>(p.output) & 3) == 0) {
 #pragma unroll
-  for (int g = 0; g < 4; ++g) {
+    for (int g = 0; g < 4; ++g) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      int row = g * 16 + result_row(lane, i);
-      auto index = static_cast<std::int64_t>(batch) * 64 + row;
-      auto* dest = splits > 1 ? partial + (index * splits + split) * 512 : p.output + index * 512;
+      for (int i = 0; i < 4; i += 2) {
+        int row = g * 16 + result_row(lane, i);
+        int col_pair = result_column(lane, i) / 2;
+        auto index = static_cast<std::int64_t>(batch) * 64 + row;
+        auto* dest = splits > 1 ? partial + (index * splits + split) * 512 : p.output + index * 512;
+        auto* pairs = reinterpret_cast<__nv_bfloat162*>(dest);
+        float factor = sm.alpha[row];
 #pragma unroll
-      for (int v = 0; v < 7; ++v)
-        dest[(v * 8 + warp) * 8 + result_column(lane, i)] =
-            __float2bfloat16_rn(output[g][v][i] * sm.alpha[row]);
-      dest[448 + warp * 8 + result_column(lane, i)] =
-          __float2bfloat16_rn(rope_output[g][i] * sm.alpha[row]);
+        for (int v = 0; v < 7; ++v)
+          pairs[(v * 8 + warp) * 4 + col_pair] = __floats2bfloat162_rn(
+              output[g][v][i] * factor, output[g][v][i + 1] * factor);
+        pairs[224 + warp * 4 + col_pair] = __floats2bfloat162_rn(
+            rope_output[g][i] * factor, rope_output[g][i + 1] * factor);
+      }
+    }
+  } else {
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        int row = g * 16 + result_row(lane, i);
+        auto index = static_cast<std::int64_t>(batch) * 64 + row;
+        auto* dest = p.output + index * 512;
+#pragma unroll
+        for (int v = 0; v < 7; ++v)
+          dest[(v * 8 + warp) * 8 + result_column(lane, i)] =
+              __float2bfloat16_rn(output[g][v][i] * sm.alpha[row]);
+        dest[448 + warp * 8 + result_column(lane, i)] =
+            __float2bfloat16_rn(rope_output[g][i] * sm.alpha[row]);
+      }
     }
   }
 }
@@ -400,7 +509,7 @@ GemmStatus sparse_mla_decode_sm120(const SparseMlaDecodeParams& p,
   float* partial_lse = splits > 1 ? reinterpret_cast<float*>(
       partial + static_cast<std::size_t>(p.batch) * 64 * splits * 512) : nullptr;
   int chunks = (p.swa_candidates + 63) / 64 + (p.compressed_candidates + 63) / 64;
-  sparse_mla::attention_kernel<<<dim3(p.batch, splits), 256, sizeof(sparse_mla::SharedStorage), stream>>>(
+  sparse_mla::attention_kernel<<<dim3(p.batch, splits), sparse_mla::kBlockThreads, sizeof(sparse_mla::SharedStorage), stream>>>(
       p, cpb, chunks, splits, partial, partial_lse);
   if (cudaPeekAtLastError() != cudaSuccess) return GemmStatus::kCudaError;
   if (splits > 1) {

@@ -14,7 +14,7 @@ Custom CuTe NVFP4 GEMM
 
 GEMM 使用 packed E2M1、UE4M3 scale、FP32 累加和 FP16 输出。新 sparse MLA decode/prefill 使用 BF16 Q/O，448 维 NVFP4 与 64 维 BF16 混合计算。
 
-> 项目处于 research preview 阶段。既有 GEMM 等路径有 RTX 5090 实测；新 DS-V4 sparse MLA decode/prefill 仅完成本地源码开发，构建、正确性和性能待服务器验证，见 [Sparse MLA](docs/SPARSE_MLA.md)。
+> 项目处于 research preview 阶段。DS-V4 sparse MLA 在 RTX 5090 上通过 25 项正确性测试（含 FlashInfer 对照）；32K CSA decode 在 B=64/512/1024 上分别达到 FlashInfer 的 1.53×/1.66×/1.69×，仅代表下述算子级测试，不是整模型端到端加速。见 [Sparse MLA](docs/SPARSE_MLA.md)。
 
 当前交付范围（2026-09-27）：**目标 kernel、正确性测试与算子 benchmark**，
 后续对接 SGLang DS-V4 后端。独立完整 block/Transformer 运行时不作为前置交付。
@@ -25,10 +25,11 @@ GEMM 使用 packed E2M1、UE4M3 scale、FP32 累加和 FP16 输出。新 sparse 
 
 - 仓库自有 Custom CuTe 单 GEMM，不调用 CUTLASS `GemmUniversal` 或 `GemmUniversalAdapter`；
 - 默认单 GEMM 按 M 自动分发：M=128 使用 Split-K=4、M=256 使用 Split-K=2，其他 M 使用通用 CuTe；
-- 显式实现 384-thread producer/consumer warp specialization、三阶段 TMA pipeline 和 persistent CTA tile scheduling；
+- 单 GEMM 显式实现 384-thread producer/consumer warp specialization、三阶段 TMA pipeline 和 persistent CTA tile scheduling；
 - FP16 epilogue 对不少于 64 行的问题使用 shared-memory staging 与 TMA store，小 M 保留低开销 predicated store；
 - 使用 `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X` 原生 block-scaled Tensor Core 指令；
 - 新 C++ CuTe sparse MLA decode 支持 DS-V4 的 64-head shared-KV、SWA＋Top-K 双缓存、混合精度 QK/PV、FP32 分母、sink 和 split 合并；原 dense prefill/decode 与 paged decode 已移除；
+- sparse MLA 使用 8 compute + 4 IO warp、两阶段 `cp.async` pipeline、非对称寄存器分配和 packed shared-memory fragment 读取；B=64/512/1024 共用同一主 kernel 实现；
 - sparse prefill 接收每个 query 独立的合法索引，一个 CTA 完整处理一行 Q，复用 decode 数学与精度规则，无 split workspace；
 - 保留 CUTLASS Collective reference，并提供 Custom CuTe、CUTLASS、cuBLASLt 三方性能与正确性对照；
 - Grouped GEMM 在一次 persistent launch 中调度多个动态 M expert；
@@ -78,7 +79,8 @@ baseline，不属于默认执行路径。
 - CUDA Toolkit 12.8+，已验证 CUDA 13.2；
 - CUTLASS 4.2+，用于 CuTe headers、SM120 MMA atom、TMA layout 和 reference kernel；
 - CMake 3.24+、C++17；
-- 可选：PyTorch 2.7+，用于 Python extension。
+- 可选：支持 `torch.float4_e2m1fn_x2` 的 PyTorch，用于完整 Python extension；
+  PyTorch 2.7 不具备完整 GEMM/MoE binding 所需的 FP4 dtype，不能构建完整扩展。
 
 ```bash
 export CUDA_ROOT=/path/to/cuda
@@ -139,8 +141,8 @@ cmake -S . -B build \
 测试覆盖：
 
 - Custom CuTe 单 GEMM CPU reference；
-- sparse MLA 的混合精度参考、稀疏索引、双缓存、sink、split、buffer 复用及 CUDA Graph（待服务器运行）；
-- sparse prefill 的逐 query 候选、ragged query 行、分块调用一致性、FlashInfer streaming prefill 对照（待服务器运行）；
+- sparse MLA 的混合精度参考、稀疏索引、双缓存、sink、split、buffer 复用及 CUDA Graph；
+- sparse prefill 的逐 query 候选、ragged query 行、分块调用一致性、FlashInfer streaming prefill 对照；
 - Custom CuTe、默认 `gemm` 与 CUTLASS reference 一致性；
 - Grouped GEMM 不均匀 expert row count；
 - Fused MoE 本地/远端路由和非均匀 activation scale；
@@ -259,27 +261,43 @@ E2M1 数据与 UE4M3 scale，并逐元素验证。
 | 128,4096,8192 | M128 Split-K=4 | 26.21 us | 13.03 us | 2.01x | 0 mismatches |
 | 256,4096,8192 | M256 Split-K=2 | 26.33 us | 18.10 us | 1.45x | 0 mismatches |
 
-DS-V4 sparse MLA 的正确性及性能待服务器验证，测试与 A/B 命令见 [Sparse MLA](docs/SPARSE_MLA.md)。
+### Sparse attention vs FlashInfer
 
-双 GPU Expert-major 对接基准（GPU 1、2，`SYS` 跨 NUMA PCIe，
-256 tokens/rank，hidden 4096，intermediate 2048，top-k 2，32 Expert）：
+2026-09-27，单张 RTX 5090，32K history 的 CSA single-token decode：
+每个请求 64 个 query heads，D=448+64，128 SWA + 512 compressed candidates。
+相同合成输入，BF16 Q/O、NVFP4 KV；FlashInfer 0.7.0 的 public sparse NVFP4
+接口自行选择调度。每个后端预热 20 次，5×100 个 CUDA Graph 样本取 P50，
+每次计时前执行 256 MiB L2 扰动（不计入延迟），无 profiler。
 
-| 路由 | 直接交接计算 P50 | 重复路由计算 P50 | 计算段加速 | 端到端加速 |
+| Batch | 本库 P50 | FlashInfer P50 | 加速比（FI/本库） | 延迟降低 |
 |---|---:|---:|---:|---:|
-| 均衡 | 0.2365 ms | 0.3002 ms | 1.27x | 1.04x |
-| 80% Rank 偏斜 | 0.1506 ms | 0.2049 ms | 1.36x | 1.03x |
+| 64 | 73.728 μs | 112.640 μs | **1.53×** | 34.55% |
+| 512 | 280.576 μs | 464.864 μs | **1.66×** | 39.64% |
+| 1024 | 475.136 μs | 801.792 μs | **1.69×** | 40.74% |
 
-两条路径最大绝对误差均为 0。该结果使用
-`torch.distributed` 参考通信验证接口与控制路径，不代表 DeepEP 原生
-NVLink/RDMA Kernel 性能；详细定义和原始数据见
-[Performance](docs/PERFORMANCE.md)。
+三个 batch 共用本库同一主 kernel，计时包含在线 Q/P/V 转换及必要的 split merge；
+不包含 compressor/indexer、cache packing、RoPE、投影或模型调度。数值检查通过；
+未锁频，监测未发现其他 compute 进程。仅代表本配置的 attention core，
+不代表 prefill、所有形状或完整模型吞吐。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/build/python" \
+python3 benchmarks/benchmark_attention_ops.py \
+  --modes decode --kinds csa --batches 64 512 1024 \
+  --context-length 32768 --warmup 20 --rounds 5 --samples 100 --seed 43 \
+  --flashinfer --flashinfer-dispatch public \
+  --output temp/attention_flashinfer_new.json
+```
+
+版本、误差、源码标识和计时边界见 [Performance](docs/PERFORMANCE.md#ds-v4-csa-sparse-mla-decode-and-prefill)。
+原始本机报告保留在 Git 忽略的 `temp/`，不发布设备标识、个人路径或内部优化笔记。
 
 ## Current limitations and roadmap
 
 - 仅支持 `compute_120a/sm_120a`；
 - sparse MLA 固定 DS-V4 `Hq=64,Hkv=1,D=448+64`、64-token 页；decode 支持 split，prefill 固定每 query 一个 CTA；尚不包含 compressor/indexer 或完整 attention block；
 - prefill 要求调用方提供每个 query 的合法索引并维持缓存生命周期，支持按 query 切分调用，尚未实现 chunked prefill 的压缩缓存状态管理；
-- sparse decode/prefill 的构建、数值、竞争检查和性能均待服务器验证；
+- sparse decode/prefill 已通过当前正确性 suite；上述性能仅覆盖 CSA decode，当前 warp-specialized 版本尚未完成独立 racecheck/memcheck，不宣称已穷尽并发安全性或模型精度验证；
 - Custom CuTe 当前只有 `128 x 128 x 128`、3-stage 配置；
 - 默认 GEMM 已完成 M=128/M=256 专用路径和其他 M 的通用回退；两条专用路径需要由 workspace query 返回的 FP32 临时空间；
 - Custom CuTe 的 FP32-output 路径及 `M < 64` 的 FP16 路径仍使用线程直接写回；其余 FP16 tile 使用 TMA store；
@@ -301,7 +319,7 @@ GEMM 阶段收尾状态：
 - [x] 为 Expert-major 路径增加调用方 Workspace 和 MoE 元数据复用；
 - [x] 增加 Grouped GEMM 与双 GPU Fused MoE 对接的可复现 benchmark；
 - [x] 实现 DS-V4 C++ CuTe sparse MLA core，并准备参考测试与 benchmark；
-- [ ] 在服务器编译、验证新 sparse MLA，并基于 profile 优化；
+- [x] 在 RTX 5090 构建、验证 sparse MLA，完成 shared-memory 优化和 warp specialization；
 - [ ] 接入 SGLang MoE runner 与 DeepEP 原生 dispatcher。
 
 ## Documentation

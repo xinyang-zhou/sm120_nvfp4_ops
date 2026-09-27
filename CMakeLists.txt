@@ -90,6 +90,12 @@ if(SM120_NVFP4_BUILD_TORCH)
   if(NOT EXISTS "${TORCH_ROOT}/include/torch/library.h")
     message(FATAL_ERROR "TORCH_ROOT must point to the installed Python torch package root")
   endif()
+  if(NOT EXISTS "${TORCH_ROOT}/include/c10/util/Float4_e2m1fn_x2.h")
+    message(FATAL_ERROR
+      "The full Python extension requires a PyTorch build with float4_e2m1fn_x2 "
+      "support; PyTorch 2.7 is insufficient. Select a compatible TORCH_ROOT, "
+      "or use -DSM120_NVFP4_BUILD_TORCH=OFF for the C++ operators.")
+  endif()
   add_library(_C MODULE
     bindings/gemm_ops.cu
     bindings/sparse_mla_ops.cpp

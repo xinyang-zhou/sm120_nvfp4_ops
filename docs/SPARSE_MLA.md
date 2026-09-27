@@ -1,9 +1,12 @@
 # DS-V4 CSA sparse MLA decode and prefill on SM120
 
-Status: implementation prepared in WSL; **not compiled, tested or benchmarked
-locally**. Server validation is required. The former dense prefill and
-dense/paged decode APIs, kernels and tests have been removed. Sparse MLA is
-the repository's attention implementation.
+Status (2026-09-27): built and tested on RTX 5090; the current sparse MLA
+suite passes **25 tests**, including FlashInfer integration. CSA decode
+benchmarks at B=64/512/1024 are recorded in [Performance](PERFORMANCE.md).
+This is operator-level validation, not model-quality or end-to-end validation;
+the current warp-specialized revision has not completed a separate sanitizer
+run. Sparse MLA is the repository's attention implementation; former
+dense/paged attention APIs have been removed.
 
 The numerical design is recorded in [attention_decode_math.tex](attention_decode_math.tex).
 This implements the attention core:
@@ -156,30 +159,41 @@ layouts, tensors and `cute::gemm`. It does not call FlashInfer or a CUTLASS
 device GEMM adapter. CuTe selects the native SM120 NVFP4 instruction; the BF16
 atom is the warp-level instruction also available on SM120.
 
-`decode.cu` defines the shared `attention_kernel`, with eight warps per CTA.
+`decode.cu` defines the shared `attention_kernel`, with 12 warps per CTA:
+eight compute warps and four dedicated raw-KV IO warps.
 `prefill.cu` selects its all-chunk, direct-output schedule. Each CTA handles all 64 heads and
 one contiguous range of 64-candidate chunks. It quantizes Q once, gathers
 raw KV, computes QK, updates softmax, prepares P/V, and accumulates both PV
 branches. Source W and destination P have separate buffers. The raw KV uses
-two buffers with `cp.async` prefetch of the next chunk and explicit wait/CTA
-barriers before consumption or reuse. Shared memory is 95 KiB per CTA.
+two buffers with `cp.async`, per-stage ready/free named barriers, and separate
+256-thread compute barriers. Each IO warp copies 16 candidates; after compute
+finishes all raw readers it releases the stage before FP4 PV. Shared memory
+is 98 KiB per CTA. This is a two-stage pipeline, not the GEMM TMA pipeline.
 
-Compared with the reference kernel described in the tex, this version uses
-the eight compute warps for V conversion after QK rather than separate IO
-warps converting V concurrently. It loads Q's BF16 RoPE part from global
-memory during QK. The merge uses one CTA/head. These are scheduling choices;
-the rounding/normalization/sink contract is preserved. Performance, register
-spills and occupancy must be measured on the server.
+The IO warpgroup releases registers to a 40-register/thread budget; the two
+compute warpgroups request 232 registers/thread through CUTLASS's SM120a
+register-reconfiguration primitives. The compiler's initial allocation is
+168 registers/thread, not the compute branch's runtime budget. The measured
+configuration remains limited to one CTA/SM and has nonzero register spilling.
+
+V conversion remains compute-owned. Adjacent non-RoPE channels reuse packed
+FP4 bytes/scales, with a balanced single-channel tail. FP4 and BF16 A fragments
+use packed shared reads; padded Q/P/weight strides reduce bank conflicts.
+Q's BF16 RoPE values are cached once per CTA in shared memory. A union reuses
+BF16 weight storage for converted V after a compute barrier. The merge uses
+one CTA/head. These scheduling changes preserve the numerical contract;
+the tex describes the mathematical reference, not an exact current schedule.
 
 For decode, `chunks_per_cta=0` uses up to nine chunks/CTA for B<=64 and all chunks for
 larger batches. For 128+512 candidates this gives two splits at B=64 and one
-at B=256/1024. This reproduces the initial documented plan, not an autotuned
+at B=512/1024. All three batches share the same main kernel implementation.
+This reproduces the initial documented plan, not an autotuned
 claim. Positive values override it. Workspace is zero for one split; otherwise
 it is `B*64*splits*(512*2+4)` bytes. No global per-chunk output/logit/P/V
 workspace is used.
 
 Prefill always uses one CTA/query and zero scratch, including T=1 and empty
-candidate lists. It keeps the same 95 KiB shared storage and CuTe MMA loop as
+candidate lists. It keeps the same 98 KiB shared storage and CuTe MMA loop as
 decode. Cross-query KV reuse, query tiling and prefill autotuning are future
 optimizations; no prefill throughput claim has been measured.
 
