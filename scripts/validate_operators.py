@@ -13,7 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "benchmarks"))
 sys.path.insert(0, str(ROOT / "tests" / "python"))
-from operator_benchmark_utils import environment, flashinfer_environment
+from common.operator_benchmark_utils import environment, flashinfer_environment
 
 MODULES = ("test_gemm", "test_grouped_gemm", "test_fused_moe", "test_sparse_mla",
            "test_sparse_mla_prefill", "test_sparse_mla_cache", "test_sparse_mla_workloads")

@@ -215,7 +215,7 @@ with [0 errors](../benchmarks/results/expert_moe_memcheck_rtx5090_2026-09-11.txt
 CUDA_VISIBLE_DEVICES=1,2 NCCL_IB_DISABLE=1 \
 PYTHONPATH="$PWD/build/python" \
 torchrun --standalone --nproc-per-node=2 \
-  benchmarks/benchmark_deepep_handoff.py \
+  benchmarks/integration/benchmark_deepep_handoff.py \
   --tokens 256 --hidden 4096 --intermediate 2048 \
   --experts 32 --topk 2 --routing balanced \
   --warmup 10 --iterations 100 \

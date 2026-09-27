@@ -1,6 +1,6 @@
 # FlashInfer SM120 CSA decode baseline
 
-`benchmark_flashinfer_csa_decode.py` measures the existing FlashInfer public API
+`benchmarks/tools/benchmark_flashinfer_csa_decode.py` measures the existing FlashInfer public API
 for B=64, 256 and 1024. Run it on the GPU server from this project's checkout,
 using the Python environment in which FlashInfer's upstream tests passed.
 The project extension does not need to be built for this script.
@@ -23,15 +23,15 @@ uses private plan inspection and cache decoding.
 First validate the new harness with the smallest target batch:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python benchmarks/benchmark_flashinfer_csa_decode.py \
+CUDA_VISIBLE_DEVICES=0 python benchmarks/tools/benchmark_flashinfer_csa_decode.py \
   --batches 64 --context-length 32768
 ```
 
 Then collect the three target batches:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python benchmarks/benchmark_flashinfer_csa_decode.py \
-  --batches 64 256 1024 --context-length 32768
+CUDA_VISIBLE_DEVICES=0 python benchmarks/tools/benchmark_flashinfer_csa_decode.py \
+  --batches 64 512 1024 --context-length 32768
 ```
 
 Default output is a short terminal summary. No log or data file is created.
@@ -121,7 +121,9 @@ The user reported `84 passed in 2.32s` for the upstream
 harness run stopped at the revision check, before any GPU benchmark, because
 the server uses `ea728cb558c32a3c58ec8fbd5a154ff676b9ab70`. Source comparison
 confirmed the compatibility described above, and that revision is now accepted.
-The updated harness still needs to be run on the server; there are no measured
-baseline results yet. All compilation, tests and performance measurements are
-performed by the user on the server; local WSL is used for editing and source
-review.
+Archived measurements are run-specific; consult the raw JSON for the actual
+revision, environment, batch list and results. This tool remains separate from
+the main attention benchmark because it needs only FlashInfer (not the project
+extension) and supports a single-call profiling mode. For same-input own/public
+A/B, use `benchmarks/benchmark_attention_ops.py --modes decode --kinds csa
+--flashinfer --flashinfer-dispatch public --output NEW_RESULT.json`.

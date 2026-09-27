@@ -11,7 +11,7 @@ import argparse
 import torch
 import sm120_nvfp4
 
-from operator_benchmark_utils import (add_timing_arguments, environment, errors,
+from common.operator_benchmark_utils import (add_timing_arguments, environment, errors,
                                       measure, run_cases, validate_timing)
 
 

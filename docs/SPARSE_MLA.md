@@ -240,8 +240,9 @@ compute-sanitizer --tool memcheck --error-exitcode 1 \
 compute-sanitizer --tool racecheck --error-exitcode 1 \
   python3 tests/python/test_sparse_mla_prefill.py SparseMlaPrefillTest.test_csa_full_lists_and_direct_decode \
   2>&1 | tee artifacts/sparse_mla/prefill_racecheck.log
-python3 benchmarks/benchmark_sparse_mla.py --batches 64 256 1024 \
-  --rounds 3 --samples 100 --flashinfer \
+python3 benchmarks/benchmark_attention_ops.py --modes decode --kinds csa \
+  --batches 64 512 1024 --context-length 32768 \
+  --rounds 3 --samples 100 --flashinfer --flashinfer-dispatch public \
   --output artifacts/sparse_mla/benchmark.json \
   2>&1 | tee artifacts/sparse_mla/benchmark.log
 ```
@@ -250,10 +251,11 @@ The integration tests compare cache packing and decode outputs/LSE with fixed
 CPB, and prefill outputs/LSE with FlashInfer's streaming prefill entry point.
 Sanitizers must report zero errors. Benchmark validates sampled requests
 before timing and records all samples/P50/P95, seed, commits, GPU, buffers and
-peak allocation. The existing benchmark measures decode; prefill performance
-has no recorded result. The public FlashInfer decode baseline chooses its own schedule;
-record its actual kernel/CPB with a profiler before claiming a controlled
-schedule comparison. Both calls use identical inputs, preallocated output and
+peak allocation. The unified benchmark also supports HCA and prefill with the
+default native comparison. Public dispatch is CSA decode only and chooses its
+own schedule; its actual kernel/CPB plan is recorded in JSON. Use
+`--flashinfer-dispatch native` (the default) for an explicit matched-CPB
+comparison. Both calls use identical inputs, preallocated output and
 scratch, and the same graph/eager and L2-flush settings. Peak allocation also
 includes construction/reference, not just kernel scratch.
 

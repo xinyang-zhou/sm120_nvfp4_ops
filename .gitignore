@@ -16,6 +16,8 @@ __pycache__/
 /third_party/flashinfer/
 
 # Local measurements, personal planning, and agent/environment configuration.
+/temp/
+/tmp/
 /artifacts/
 /results_*.json
 *.log

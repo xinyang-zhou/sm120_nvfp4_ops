@@ -130,7 +130,7 @@ endif()
 
 if(SM120_NVFP4_BUILD_BENCHMARKS)
   add_executable(
-    benchmark_gemm_specialized benchmarks/benchmark_gemm_specialized.cu)
+    benchmark_gemm_specialized benchmarks/tools/benchmark_gemm_specialized.cu)
   sm120_nvfp4_configure_target(benchmark_gemm_specialized)
   target_link_libraries(
     benchmark_gemm_specialized PRIVATE sm120_nvfp4_gemm)
@@ -150,7 +150,7 @@ if(SM120_NVFP4_BUILD_BENCHMARKS)
     PRIVATE sm120_nvfp4_grouped_gemm CUDA::cublasLt)
 
   add_executable(
-    probe_cublaslt_grouped benchmarks/probe_cublaslt_grouped.cu)
+    probe_cublaslt_grouped benchmarks/tools/probe_cublaslt_grouped.cu)
   target_link_libraries(probe_cublaslt_grouped PRIVATE CUDA::cublasLt CUDA::cudart)
   target_compile_options(probe_cublaslt_grouped PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120a,code=sm_120a>)

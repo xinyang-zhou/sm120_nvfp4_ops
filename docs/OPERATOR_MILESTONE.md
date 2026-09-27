@@ -86,8 +86,11 @@ GPU event 区间，`--l2-flush-mib 0` 单独测热缓存。对照两侧的设置
 
 FlashInfer attention 对照使用固定版本的 allocation-free native 入口，显式匹配
 CPB/候选顺序，双方 output/LSE/scratch 都预分配。prefill 双方一 query 一个 CTA。
-这不是公共 auto planner 的性能结果；原有 `benchmark_flashinfer_csa_decode.py`
-与 `benchmark_sparse_mla.py` 保留用于 public-dispatch 对照，不混合两种表格。
+这不是公共 auto planner 的性能结果。CSA decode 的 public-dispatch 对照已统一到
+`benchmark_attention_ops.py --modes decode --kinds csa --flashinfer --flashinfer-dispatch public`，
+实际 plan 会写入 JSON；该公共 API 不返回 LSE，因此只与本库比较输出，本库 LSE 仍对照独立参考。
+不需要本库扩展的独立基线和 profiling 工具位于
+`benchmarks/tools/benchmark_flashinfer_csa_decode.py`，两种结果不混成同一对照口径。
 FlashInfer native decode 的保守 scratch 分配与本库紧凑 split 分配分别记录。
 
 cache 的 pack 表示向预分配 cache 的顺序量化写入；append 使用不重复随机 slot，

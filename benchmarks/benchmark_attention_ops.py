@@ -9,7 +9,7 @@ import sys
 import torch
 import sm120_nvfp4
 
-from operator_benchmark_utils import (add_timing_arguments, environment, errors,
+from common.operator_benchmark_utils import (add_timing_arguments, environment, errors,
     flashinfer_environment, measure, run_cases, validate_timing)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,7 +62,8 @@ def case(spec, args):
         excluded="cache packing, compressor/indexer/selection, RoPE, projections, JIT, reference")
 
     baseline = None
-    if args.flashinfer:
+    public_plan = None
+    if args.flashinfer and args.flashinfer_dispatch == "native":
         # Pinned allocation-free native entry: identical candidate order/CPB.
         # This is explicitly NOT the public auto-planner performance baseline.
         from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4 import _sparse_mla_nvfp4_sm120_paged_attention
@@ -85,8 +86,47 @@ def case(spec, args):
         if difference["rmse"] > .005:
             raise AssertionError("FlashInfer matched-schedule RMSE exceeds .005")
         result["flashinfer"] = dict(accuracy_vs_own=difference,
+            dispatch="native", lse_compared=True,
             schedule="native prefill" if prefill else "native decode, explicit matched CPB",
             workspace_bytes=0 if prefill else mid_out.numel() * 2 + mid_lse.numel() * 4)
+    elif args.flashinfer:
+        # CSA single-token decode only. The public dispatcher owns its CPB;
+        # do not label this comparison as a matched-schedule/native baseline.
+        from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+        from common.flashinfer_public import inspect_public_plan
+
+        fi_output = torch.empty_like(q)
+        fi_workspace = torch.empty(64 << 20, device="cuda", dtype=torch.uint8)
+        public_q, public_out = q[:, None], fi_output[:, None]
+        public_swa, public_comp = swa[:, None], comp[:, None]
+
+        def baseline():
+            trtllm_batch_decode_sparse_mla_dsv4(
+                query=public_q, swa_kv_cache=public_swa, workspace_buffer=fi_workspace,
+                sparse_indices=si, swa_topk_lens=kwargs["swa_lengths"],
+                compressed_kv_cache=public_comp, extra_sparse_indices=ci,
+                extra_sparse_topk_lens=kwargs["compressed_lengths"], sinks=kwargs["sink"],
+                out=public_out, bmm1_scale=512**-.5, kv_layout="HND", backend="sparse",
+                kv_cache_format="nvfp4")
+            return (fi_output,)
+
+        def public_plan():
+            return inspect_public_plan(public_q, public_swa, si, public_out,
+                kwargs["swa_lengths"], kwargs["sink"], public_comp, ci,
+                kwargs["compressed_lengths"])
+
+        baseline()
+        torch.testing.assert_close(output, fi_output, rtol=.07, atol=.03)
+        difference = errors(output, fi_output)
+        if difference["rmse"] > .005:
+            raise AssertionError("FlashInfer public-dispatch RMSE exceeds .005")
+        selected = public_plan()
+        if selected["numeric_route"] != "nvfp4":
+            raise RuntimeError(f"Unexpected public numeric route: {selected}")
+        result["flashinfer"] = dict(accuracy_vs_own=difference,
+            dispatch="public", schedule="public sparse NVFP4 auto planner",
+            plan=selected, workspace_bytes=fi_workspace.numel(), lse_compared=False,
+            lse_note="The public API does not return LSE; own LSE is checked against the reference")
 
     # Alternate which backend is measured first across cases; no profiler runs
     # belong in this timing sweep. Keep the same L2 disturbance and graph mode.
@@ -102,10 +142,12 @@ def case(spec, args):
     result["core_queries_per_second"] = rows * 1.e6 / result["timing"]["p50_us"]
     if baseline:
         result["speedup_vs_flashinfer"] = result["flashinfer"]["timing"]["p50_us"] / result["timing"]["p50_us"]
+    if public_plan is not None and public_plan() != result["flashinfer"]["plan"]:
+        raise RuntimeError("Public planner changed during timing; rerun after calibration settles")
     return result
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--modes", nargs="+", choices=("decode", "prefill"), default=["decode", "prefill"])
     parser.add_argument("--kinds", nargs="+", choices=("csa", "hca"), default=["csa", "hca"])
@@ -117,14 +159,26 @@ def main():
     parser.add_argument("--mixed-lengths", action="store_true")
     parser.add_argument("--selection", choices=("random", "contiguous"), default="random")
     parser.add_argument("--chunks-per-cta", type=int, default=0)
+    parser.add_argument("--flashinfer-dispatch", choices=("native", "public"), default="native",
+        help="with --flashinfer: matched-CPB native kernels (default), or public auto planner (CSA decode only)")
     add_timing_arguments(parser)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     validate_timing(parser, args)
     if (min(args.batches + args.prefill_batches + args.query_lengths) < 1 or
             args.context_length < 0 or args.context_length + max(args.query_lengths) > 1048576 or
             max(args.batches + [b * q for b in args.prefill_batches for q in args.query_lengths]) > 1048576 or
             not 0 <= args.chunks_per_cta <= 2147483647):
         parser.error("invalid request/query/context/cpb sizes")
+    if args.flashinfer_dispatch == "public":
+        if not args.flashinfer:
+            parser.error("--flashinfer-dispatch public requires --flashinfer")
+        if args.modes != ["decode"] or args.kinds != ["csa"]:
+            parser.error("public dispatch requires --modes decode --kinds csa")
+    return args
+
+
+def main():
+    args = parse_args()
     metadata = environment(__file__)
     if args.flashinfer:
         metadata["flashinfer"] = flashinfer_environment()

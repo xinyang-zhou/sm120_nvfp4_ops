@@ -124,6 +124,10 @@ sweep。字段包含设备/CUDA/cuBLASLt 版本、计时方法、输入分布、
 workspace、correctness 和原始命令。现有性能声明与原始产物状态见
 [结果索引](benchmarks/results/README.md)。
 
+常用 benchmark 主目录只保留 GEMM、Grouped GEMM、attention、cache 和 MoE
+五个入口；专项诊断位于 `benchmarks/tools/`，模型/多卡实验位于
+`benchmarks/integration/`。完整用途和旧命令迁移见 [Benchmark 导航](benchmarks/README.md)。
+
 不构建 PyTorch extension：
 
 ```bash

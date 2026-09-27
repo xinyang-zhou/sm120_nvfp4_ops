@@ -8,6 +8,7 @@
 #include <cuda_fp8.h>
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include "mma.cuh"
 #include "quantization.cuh"
 

@@ -20,6 +20,10 @@ import statistics
 import subprocess
 import sys
 
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "benchmarks"))
+from common.flashinfer_public import inspect_public_plan
+
 import torch
 import flashinfer
 from flashinfer.mla import (
@@ -173,20 +177,6 @@ def errors(actual: torch.Tensor, expected: torch.Tensor) -> dict:
         "cosine_mean": torch.nn.functional.cosine_similarity(
             actual.flatten(0, -2), expected.flatten(0, -2), dim=-1).mean().item(),
     }
-
-
-def inspect_public_plan(q, swa_cache, swa_ids, output, swa_lengths, sink,
-                        comp_cache, comp_ids, comp_lengths):
-    # Read the same metadata-keyed plan used by the public facade. This private
-    # diagnostic is why this script accepts only reviewed source revisions.
-    from flashinfer.mla._sparse_mla_sm120 import _prepared
-
-    tensors = (q[:, 0], swa_cache, swa_ids, output[:, 0], swa_lengths, sink,
-               comp_cache, comp_ids, comp_lengths, None, None, None)
-    prepared = _prepared._functional_plan(tensors, 1, True, False)
-    info = dict(prepared.plan.inspect())
-    text_fields = {"numeric_route", "implementation", "merge"}
-    return {str(k): str(v) if str(k) in text_fields else int(v) for k, v in info.items()}
 
 
 def measure(run, args: argparse.Namespace) -> tuple[list[list[float]], torch.Tensor]:

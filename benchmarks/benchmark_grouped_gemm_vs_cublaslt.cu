@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-#include "benchmark_io.hpp"
+#include "common/benchmark_io.hpp"
 #include "sm120_nvfp4/gemm.hpp"
 #include "sm120_nvfp4/grouped_gemm.hpp"
 

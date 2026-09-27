@@ -13,7 +13,7 @@ import traceback
 
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 REVIEWED_FLASHINFER = {
     "37b4d30eac39b89f198b893dd11914bd76f5fcf8",
     "ea728cb558c32a3c58ec8fbd5a154ff676b9ab70",
@@ -39,7 +39,9 @@ def environment(script):
         working_tree=git_value(ROOT, "status", "--porcelain"),
         script_sha256=hashlib.sha256(Path(script).read_bytes()).hexdigest(),
         source_sha256={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-                       for p in sorted(sources)},
+                       for p in sorted(sources) if p.is_file()},
+        missing_source_files=[str(p.relative_to(ROOT)) for p in sorted(sources)
+                              if not p.is_file()],
         command=[sys.executable, *sys.argv], python=sys.version,
         torch=torch.__version__, cuda=torch.version.cuda, gpu=props.name,
         gpu_uuid=str(getattr(props, "uuid", "unknown")), gpu_memory_bytes=props.total_memory,

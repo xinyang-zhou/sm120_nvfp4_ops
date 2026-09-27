@@ -10,7 +10,7 @@ import sys
 import torch
 import sm120_nvfp4
 
-from operator_benchmark_utils import (add_timing_arguments, environment,
+from common.operator_benchmark_utils import (add_timing_arguments, environment,
     flashinfer_environment, measure, run_cases, validate_timing)
 
 ROOT = Path(__file__).resolve().parents[1]
